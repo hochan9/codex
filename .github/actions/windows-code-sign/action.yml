@@ -52,6 +52,8 @@ runs:
         cache-dependencies: false
         files: |
           ${{ github.workspace }}/codex-rs/target/${{ inputs.target }}/release/codex.exe
+          ${{ github.workspace }}/codex-rs/target/${{ inputs.target }}/release/sub-codex.exe
+          ${{ github.workspace }}/codex-rs/target/${{ inputs.target }}/release/codex-agent.exe
           ${{ github.workspace }}/codex-rs/target/${{ inputs.target }}/release/codex-responses-api-proxy.exe
           ${{ github.workspace }}/codex-rs/target/${{ inputs.target }}/release/codex-windows-sandbox-setup.exe
           ${{ github.workspace }}/codex-rs/target/${{ inputs.target }}/release/codex-command-runner.exe

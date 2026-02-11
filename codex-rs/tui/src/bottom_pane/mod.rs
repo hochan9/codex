@@ -24,6 +24,7 @@ use crate::key_hint::KeyBinding;
 use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
+use crate::slash_command::CommandDescriptionLanguage;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
 use codex_core::features::Features;
@@ -282,6 +283,11 @@ impl BottomPane {
 
     pub fn set_personality_command_enabled(&mut self, enabled: bool) {
         self.composer.set_personality_command_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub fn set_command_description_language(&mut self, language: CommandDescriptionLanguage) {
+        self.composer.set_command_description_language(language);
         self.request_redraw();
     }
 

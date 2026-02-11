@@ -2573,9 +2573,6 @@
                 "null"
               ]
             },
-            "turn_id": {
-              "type": "string"
-            },
             "type": {
               "enum": [
                 "task_started"
@@ -2585,7 +2582,6 @@
             }
           },
           "required": [
-            "turn_id",
             "type"
           ],
           "title": "TaskStartedEventMsg",
@@ -2600,9 +2596,6 @@
                 "null"
               ]
             },
-            "turn_id": {
-              "type": "string"
-            },
             "type": {
               "enum": [
                 "task_complete"
@@ -2612,7 +2605,6 @@
             }
           },
           "required": [
-            "turn_id",
             "type"
           ],
           "title": "TaskCompleteEventMsg",
@@ -4149,12 +4141,6 @@
           "properties": {
             "reason": {
               "$ref": "#/definitions/TurnAbortReason"
-            },
-            "turn_id": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "type": {
               "enum": [
@@ -6553,18 +6539,6 @@
             {
               "type": "null"
             }
-          ]
-        },
-        "limit_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "limit_name": {
-          "type": [
-            "string",
-            "null"
           ]
         },
         "plan_type": {
@@ -11849,22 +11823,7 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "rateLimits": {
-            "allOf": [
-              {
-                "$ref": "#/definitions/v2/RateLimitSnapshot"
-              }
-            ],
-            "description": "Backward-compatible single-bucket view; mirrors the historical payload."
-          },
-          "rateLimitsByLimitId": {
-            "additionalProperties": {
-              "$ref": "#/definitions/v2/RateLimitSnapshot"
-            },
-            "description": "Multi-bucket view keyed by metered `limit_id` (for example, `codex`).",
-            "type": [
-              "object",
-              "null"
-            ]
+            "$ref": "#/definitions/v2/RateLimitSnapshot"
           }
         },
         "required": [
@@ -12877,18 +12836,6 @@
               {
                 "type": "null"
               }
-            ]
-          },
-          "limitId": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "limitName": {
-            "type": [
-              "string",
-              "null"
             ]
           },
           "planType": {

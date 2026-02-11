@@ -214,10 +214,7 @@ impl Session {
             self.record_conversation_items(turn_context.as_ref(), &pending_response_items)
                 .await;
         }
-        let event = EventMsg::TurnComplete(TurnCompleteEvent {
-            turn_id: turn_context.sub_id.clone(),
-            last_agent_message,
-        });
+        let event = EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message });
         self.send_event(turn_context.as_ref(), event).await;
     }
 
@@ -293,10 +290,7 @@ impl Session {
             self.flush_rollout().await;
         }
 
-        let event = EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: Some(task.turn_context.sub_id.clone()),
-            reason,
-        });
+        let event = EventMsg::TurnAborted(TurnAbortedEvent { reason });
         self.send_event(task.turn_context.as_ref(), event).await;
     }
 }

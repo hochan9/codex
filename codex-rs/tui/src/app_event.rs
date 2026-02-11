@@ -21,6 +21,7 @@ use codex_protocol::openai_models::ModelPreset;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::history_cell::HistoryCell;
+use crate::slash_command::CommandDescriptionLanguage;
 
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
@@ -55,6 +56,23 @@ pub(crate) enum AppEvent {
     OpenAgentPicker,
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
+    /// Open the named-agent manager popup.
+    OpenAgentsPopup,
+    /// Activate a named agent profile.
+    ActivateNamedAgent(String),
+    /// Begin the two-step named-agent creation flow.
+    BeginCreateNamedAgent,
+    /// Step 1 complete: named-agent name captured.
+    NamedAgentNameSubmitted(String),
+    /// Step 2 complete: named-agent prompt captured.
+    NamedAgentPromptSubmitted {
+        name: String,
+        prompt: String,
+    },
+    /// Remove a named agent profile.
+    DeleteNamedAgent(String),
+    /// Update slash-command description language in command help popups.
+    SetCommandDescriptionLanguage(CommandDescriptionLanguage),
 
     /// Start a new session.
     NewSession,
@@ -125,15 +143,6 @@ pub(crate) enum AppEvent {
     },
 
     InsertHistoryCell(Box<dyn HistoryCell>),
-
-    /// Apply rollback semantics to local transcript cells.
-    ///
-    /// This is emitted when rollback was not initiated by the current
-    /// backtrack flow so trimming occurs in AppEvent queue order relative to
-    /// inserted history cells.
-    ApplyThreadRollback {
-        num_turns: u32,
-    },
 
     StartCommitAnimation,
     StopCommitAnimation,

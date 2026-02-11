@@ -1,5 +1,6 @@
 use clap::Args;
 use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
 use clap_complete::Shell;
 use clap_complete::generate;
@@ -367,6 +368,60 @@ struct StdioToUdsCommand {
     socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationAlias {
+    Codex,
+    SubCodex,
+    CodexAgent,
+}
+
+impl InvocationAlias {
+    fn detect() -> Self {
+        let argv0 = std::env::args_os().next().unwrap_or_default();
+        let argv0_path = PathBuf::from(argv0);
+        let name = argv0_path
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or("codex");
+        match name {
+            "sub-codex" => Self::SubCodex,
+            "codex-agent" => Self::CodexAgent,
+            _ => Self::Codex,
+        }
+    }
+
+    fn bin_name(self) -> &'static str {
+        match self {
+            InvocationAlias::Codex => "codex",
+            InvocationAlias::SubCodex => "sub-codex",
+            InvocationAlias::CodexAgent => "codex-agent",
+        }
+    }
+
+    fn override_usage(self) -> String {
+        let name = self.bin_name();
+        format!("{name} [OPTIONS] [PROMPT]\n       {name} [OPTIONS] <COMMAND> [ARGS]")
+    }
+
+    fn is_subagent_alias(self) -> bool {
+        matches!(
+            self,
+            InvocationAlias::SubCodex | InvocationAlias::CodexAgent
+        )
+    }
+}
+
+fn parse_multitool_cli(invocation_alias: InvocationAlias) -> MultitoolCli {
+    let command = MultitoolCli::command()
+        .bin_name(invocation_alias.bin_name())
+        .override_usage(invocation_alias.override_usage());
+    let matches = command.get_matches();
+    match MultitoolCli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    }
+}
+
 fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
     let AppExitInfo {
         token_usage,
@@ -541,12 +596,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+    let invocation_alias = InvocationAlias::detect();
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse();
+    } = parse_multitool_cli(invocation_alias);
+
+    apply_invocation_alias_defaults(invocation_alias, &mut root_config_overrides);
 
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
@@ -558,6 +616,12 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 &mut interactive.config_overrides,
                 root_config_overrides.clone(),
             );
+            if invocation_alias.is_subagent_alias() && std::io::stderr().is_terminal() {
+                eprintln!(
+                    "Launching {} with sub-agent defaults (features.collab=true).",
+                    invocation_alias.bin_name()
+                );
+            }
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
             handle_app_exit(exit_info)?;
         }
@@ -690,7 +754,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             run_logout(logout_cli.config_overrides).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
-            print_completion(completion_cli);
+            print_completion(completion_cli, invocation_alias);
         }
         Some(Subcommand::Cloud(mut cloud_cli)) => {
             prepend_config_flags(
@@ -874,6 +938,17 @@ fn prepend_config_flags(
         .splice(0..0, cli_config_overrides.raw_overrides);
 }
 
+fn apply_invocation_alias_defaults(
+    invocation_alias: InvocationAlias,
+    root_config_overrides: &mut CliConfigOverrides,
+) {
+    if invocation_alias.is_subagent_alias() {
+        root_config_overrides
+            .raw_overrides
+            .splice(0..0, ["features.collab=true".to_string()]);
+    }
+}
+
 async fn run_interactive_tui(
     mut interactive: TuiCli,
     codex_linux_sandbox_exe: Option<PathBuf>,
@@ -1013,9 +1088,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         .extend(subcommand_cli.config_overrides.raw_overrides);
 }
 
-fn print_completion(cmd: CompletionCommand) {
+fn print_completion(cmd: CompletionCommand, invocation_alias: InvocationAlias) {
     let mut app = MultitoolCli::command();
-    let name = "codex";
+    let name = invocation_alias.bin_name();
     generate(cmd.shell, &mut app, name, &mut std::io::stdout());
 }
 
@@ -1168,6 +1243,35 @@ mod tests {
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
                 "To continue this session, run codex resume my-thread".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invocation_alias_usage_uses_alias_name() {
+        assert_eq!(InvocationAlias::SubCodex.bin_name(), "sub-codex");
+        assert_eq!(
+            InvocationAlias::SubCodex.override_usage(),
+            "sub-codex [OPTIONS] [PROMPT]\n       sub-codex [OPTIONS] <COMMAND> [ARGS]"
+        );
+        assert_eq!(InvocationAlias::CodexAgent.bin_name(), "codex-agent");
+    }
+
+    #[test]
+    fn subagent_alias_applies_collab_override_with_low_precedence() {
+        let mut overrides = CliConfigOverrides {
+            raw_overrides: vec![
+                "features.collab=false".to_string(),
+                "model=\"gpt-5\"".to_string(),
+            ],
+        };
+        apply_invocation_alias_defaults(InvocationAlias::SubCodex, &mut overrides);
+        assert_eq!(
+            overrides.raw_overrides,
+            vec![
+                "features.collab=true".to_string(),
+                "features.collab=false".to_string(),
+                "model=\"gpt-5\"".to_string(),
             ]
         );
     }

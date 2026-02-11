@@ -25,7 +25,6 @@
 //! the final answer. During streaming we hide the status row to avoid duplicate
 //! progress indicators; once commentary completes and stream queues drain, we
 //! re-show it so users still see turn-in-progress state between output bursts.
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -42,12 +41,12 @@ use crate::bottom_pane::StatusLineSetupView;
 use crate::status::RateLimitWindowDisplay;
 use crate::status::format_directory_display;
 use crate::status::format_tokens_compact;
-use crate::status::rate_limit_snapshot_display_for_limit;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
+use codex_core::agents_store::AgentDefinition;
 use codex_core::config::Config;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
@@ -155,6 +154,9 @@ const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
+const NAMED_AGENT_REGISTRY_MAX_ITEMS: usize = 12;
+const NAMED_AGENT_DESCRIPTION_PREVIEW_GRAPHEMES: usize = 120;
+const NAMED_AGENT_PROMPT_PREVIEW_GRAPHEMES: usize = 600;
 
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
@@ -206,6 +208,7 @@ use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt;
 use crate::render::renderable::RenderableItem;
+use crate::slash_command::CommandDescriptionLanguage;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
 use crate::text_formatting::truncate_text;
@@ -507,13 +510,21 @@ pub(crate) struct ChatWidget {
     current_collaboration_mode: CollaborationMode,
     /// The currently active collaboration mask, if any.
     active_collaboration_mask: Option<CollaborationModeMask>,
+    /// Named specialist profiles available for delegation.
+    named_agents_registry: Vec<AgentDefinition>,
+    /// Optional named specialist agent selected by the user.
+    active_named_agent: Option<AgentDefinition>,
+    /// Language used in slash-command popup descriptions.
+    command_description_language: CommandDescriptionLanguage,
+    /// Aggregated sub-agent progress for active/queued/done board rendering.
+    collab_progress_board: collab::ProgressBoard,
     auth_manager: Arc<AuthManager>,
     models_manager: Arc<ModelsManager>,
     otel_manager: OtelManager,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
-    rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+    rate_limit_snapshot: Option<RateLimitSnapshotDisplay>,
     plan_type: Option<PlanType>,
     rate_limit_warnings: RateLimitWarningState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
@@ -1314,6 +1325,7 @@ impl ChatWidget {
         self.pending_status_indicator_restore = false;
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(String::from("Working"));
+        self.collab_progress_board.reset();
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
         self.request_redraw();
@@ -1500,18 +1512,10 @@ impl ChatWidget {
 
     pub(crate) fn on_rate_limit_snapshot(&mut self, snapshot: Option<RateLimitSnapshot>) {
         if let Some(mut snapshot) = snapshot {
-            let limit_id = snapshot
-                .limit_id
-                .clone()
-                .unwrap_or_else(|| "codex".to_string());
-            let limit_label = snapshot
-                .limit_name
-                .clone()
-                .unwrap_or_else(|| limit_id.clone());
             if snapshot.credits.is_none() {
                 snapshot.credits = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get(&limit_id)
+                    .rate_limit_snapshot
+                    .as_ref()
                     .and_then(|display| display.credits.as_ref())
                     .map(|credits| CreditsSnapshot {
                         has_credits: credits.has_credits,
@@ -1522,38 +1526,32 @@ impl ChatWidget {
 
             self.plan_type = snapshot.plan_type.or(self.plan_type);
 
-            let is_codex_limit = limit_id.eq_ignore_ascii_case("codex");
-            let warnings = if is_codex_limit {
-                self.rate_limit_warnings.take_warnings(
-                    snapshot
-                        .secondary
-                        .as_ref()
-                        .map(|window| window.used_percent),
-                    snapshot
-                        .secondary
-                        .as_ref()
-                        .and_then(|window| window.window_minutes),
-                    snapshot.primary.as_ref().map(|window| window.used_percent),
-                    snapshot
-                        .primary
-                        .as_ref()
-                        .and_then(|window| window.window_minutes),
-                )
-            } else {
-                vec![]
-            };
-
-            let high_usage = is_codex_limit
-                && (snapshot
+            let warnings = self.rate_limit_warnings.take_warnings(
+                snapshot
                     .secondary
                     .as_ref()
+                    .map(|window| window.used_percent),
+                snapshot
+                    .secondary
+                    .as_ref()
+                    .and_then(|window| window.window_minutes),
+                snapshot.primary.as_ref().map(|window| window.used_percent),
+                snapshot
+                    .primary
+                    .as_ref()
+                    .and_then(|window| window.window_minutes),
+            );
+
+            let high_usage = snapshot
+                .secondary
+                .as_ref()
+                .map(|w| w.used_percent >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
+                .unwrap_or(false)
+                || snapshot
+                    .primary
+                    .as_ref()
                     .map(|w| w.used_percent >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
-                    .unwrap_or(false)
-                    || snapshot
-                        .primary
-                        .as_ref()
-                        .map(|w| w.used_percent >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
-                        .unwrap_or(false));
+                    .unwrap_or(false);
 
             if high_usage
                 && !self.rate_limit_switch_prompt_hidden()
@@ -1566,10 +1564,8 @@ impl ChatWidget {
                 self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Pending;
             }
 
-            let display =
-                rate_limit_snapshot_display_for_limit(&snapshot, limit_label, Local::now());
-            self.rate_limit_snapshots_by_limit_id
-                .insert(limit_id, display);
+            let display = crate::status::rate_limit_snapshot_display(&snapshot, Local::now());
+            self.rate_limit_snapshot = Some(display);
 
             if !warnings.is_empty() {
                 for warning in warnings {
@@ -1578,7 +1574,7 @@ impl ChatWidget {
                 self.request_redraw();
             }
         } else {
-            self.rate_limit_snapshots_by_limit_id.clear();
+            self.rate_limit_snapshot = None;
         }
         self.refresh_status_line();
     }
@@ -2620,13 +2616,17 @@ impl ChatWidget {
             skills_initial_state: None,
             current_collaboration_mode,
             active_collaboration_mask,
+            named_agents_registry: Vec::new(),
+            active_named_agent: None,
+            command_description_language: CommandDescriptionLanguage::English,
+            collab_progress_board: collab::ProgressBoard::default(),
             auth_manager,
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
-            rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
@@ -2785,13 +2785,17 @@ impl ChatWidget {
             skills_initial_state: None,
             current_collaboration_mode,
             active_collaboration_mask,
+            named_agents_registry: Vec::new(),
+            active_named_agent: None,
+            command_description_language: CommandDescriptionLanguage::English,
+            collab_progress_board: collab::ProgressBoard::default(),
             auth_manager,
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
-            rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
@@ -2939,13 +2943,17 @@ impl ChatWidget {
             skills_initial_state: None,
             current_collaboration_mode,
             active_collaboration_mask,
+            named_agents_registry: Vec::new(),
+            active_named_agent: None,
+            command_description_language: CommandDescriptionLanguage::English,
+            collab_progress_board: collab::ProgressBoard::default(),
             auth_manager,
             models_manager,
             otel_manager,
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
-            rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            rate_limit_snapshot: None,
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
@@ -3273,6 +3281,9 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::Language => {
+                self.open_command_description_language_popup();
+            }
             SlashCommand::Personality => {
                 self.open_personality_popup();
             }
@@ -3302,6 +3313,9 @@ impl ChatWidget {
             }
             SlashCommand::Agent => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
+            }
+            SlashCommand::Agents => {
+                self.app_event_tx.send(AppEvent::OpenAgentsPopup);
             }
             SlashCommand::Approvals => {
                 self.open_permissions_popup();
@@ -3584,6 +3598,96 @@ impl ChatWidget {
         );
 
         self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn open_named_agent_name_prompt(&mut self) {
+        let tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new(
+            "Create agent (1/2)".to_string(),
+            "Agent name".to_string(),
+            Some("Enter a short, memorable name.".to_string()),
+            Box::new(move |name: String| {
+                tx.send(AppEvent::NamedAgentNameSubmitted(name));
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn open_named_agent_prompt_prompt(&mut self, agent_name: String) {
+        let tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new(
+            "Create agent (2/2)".to_string(),
+            "System instructions for this agent".to_string(),
+            Some(format!("Agent: {agent_name}")),
+            Box::new(move |prompt: String| {
+                tx.send(AppEvent::NamedAgentPromptSubmitted {
+                    name: agent_name.clone(),
+                    prompt,
+                });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn set_active_named_agent(&mut self, agent: Option<AgentDefinition>) {
+        self.active_named_agent = agent;
+        self.refresh_model_display();
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_command_description_language(
+        &mut self,
+        language: CommandDescriptionLanguage,
+    ) {
+        self.command_description_language = language;
+        self.bottom_pane.set_command_description_language(language);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_named_agents_registry(&mut self, mut agents: Vec<AgentDefinition>) {
+        agents.sort_by(|left, right| left.name.cmp(&right.name));
+        self.named_agents_registry = agents;
+    }
+
+    fn open_command_description_language_popup(&mut self) {
+        let language = self.command_description_language;
+        let items = vec![
+            SelectionItem {
+                name: "English".to_string(),
+                description: Some("Show slash-command descriptions in English.".to_string()),
+                is_current: language == CommandDescriptionLanguage::English,
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::SetCommandDescriptionLanguage(
+                        CommandDescriptionLanguage::English,
+                    ));
+                })],
+                dismiss_on_select: true,
+                search_value: Some("english en".to_string()),
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Korean".to_string(),
+                description: Some("슬래시 명령 설명을 한국어로 표시합니다.".to_string()),
+                is_current: language == CommandDescriptionLanguage::Korean,
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::SetCommandDescriptionLanguage(
+                        CommandDescriptionLanguage::Korean,
+                    ));
+                })],
+                dismiss_on_select: true,
+                search_value: Some("korean ko kr 한글 한국어".to_string()),
+                ..Default::default()
+            },
+        ];
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Command Description Language".to_string()),
+            subtitle: Some("Choose language for slash-command help text.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: false,
+            ..Default::default()
+        });
+        self.request_redraw();
     }
 
     pub(crate) fn handle_paste(&mut self, text: String) {
@@ -3947,9 +4051,9 @@ impl ChatWidget {
             }
             EventMsg::AgentReasoningSectionBreak(_) => self.on_reasoning_section_break(),
             EventMsg::TurnStarted(_) => self.on_task_started(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                last_agent_message, ..
-            }) => self.on_task_complete(last_agent_message, from_replay),
+            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message }) => {
+                self.on_task_complete(last_agent_message, from_replay)
+            }
             EventMsg::TokenCount(ev) => {
                 self.set_token_info(ev.info);
                 self.on_rate_limit_snapshot(ev.rate_limits);
@@ -4047,25 +4151,47 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::CollabAgentSpawnBegin(_) => {}
-            EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(collab::spawn_end(ev)),
+            EventMsg::CollabAgentSpawnBegin(ev) => {
+                self.collab_progress_board.on_spawn_begin(ev.call_id);
+                self.request_redraw();
+            }
+            EventMsg::CollabAgentSpawnEnd(ev) => {
+                self.collab_progress_board
+                    .on_spawn_end(&ev.call_id, ev.new_thread_id, &ev.status);
+                self.on_collab_event(collab::spawn_end(ev));
+            }
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
+                self.collab_progress_board
+                    .on_interaction_end(ev.receiver_thread_id, &ev.status);
                 self.on_collab_event(collab::interaction_end(ev))
             }
-            EventMsg::CollabWaitingBegin(ev) => self.on_collab_event(collab::waiting_begin(ev)),
-            EventMsg::CollabWaitingEnd(ev) => self.on_collab_event(collab::waiting_end(ev)),
-            EventMsg::CollabCloseBegin(_) => {}
-            EventMsg::CollabCloseEnd(ev) => self.on_collab_event(collab::close_end(ev)),
-            EventMsg::CollabResumeBegin(ev) => self.on_collab_event(collab::resume_begin(ev)),
-            EventMsg::CollabResumeEnd(ev) => self.on_collab_event(collab::resume_end(ev)),
-            EventMsg::ThreadRolledBack(rollback) => {
-                if from_replay {
-                    self.app_event_tx.send(AppEvent::ApplyThreadRollback {
-                        num_turns: rollback.num_turns,
-                    });
-                }
+            EventMsg::CollabWaitingBegin(ev) => {
+                self.collab_progress_board
+                    .on_wait_begin(&ev.receiver_thread_ids);
+                self.on_collab_event(collab::waiting_begin(ev));
             }
+            EventMsg::CollabWaitingEnd(ev) => {
+                self.collab_progress_board.on_wait_end(&ev.statuses);
+                self.on_collab_event(collab::waiting_end(ev));
+            }
+            EventMsg::CollabCloseBegin(_) => {}
+            EventMsg::CollabCloseEnd(ev) => {
+                self.collab_progress_board
+                    .on_close_end(ev.receiver_thread_id);
+                self.on_collab_event(collab::close_end(ev));
+            }
+            EventMsg::CollabResumeBegin(ev) => {
+                self.collab_progress_board
+                    .on_resume_begin(ev.receiver_thread_id);
+                self.on_collab_event(collab::resume_begin(ev));
+            }
+            EventMsg::CollabResumeEnd(ev) => {
+                self.collab_progress_board
+                    .on_resume_end(ev.receiver_thread_id, &ev.status);
+                self.on_collab_event(collab::resume_end(ev));
+            }
+            EventMsg::ThreadRolledBack(_) => {}
             EventMsg::RawResponseItem(_)
             | EventMsg::ItemStarted(_)
             | EventMsg::AgentMessageContentDelta(_)
@@ -4246,12 +4372,8 @@ impl ChatWidget {
             .unwrap_or(&default_usage);
         let collaboration_mode = self.collaboration_mode_label();
         let reasoning_effort_override = Some(self.effective_reasoning_effort());
-        let rate_limit_snapshots: Vec<RateLimitSnapshotDisplay> = self
-            .rate_limit_snapshots_by_limit_id
-            .values()
-            .cloned()
-            .collect();
-        self.add_to_history(crate::status::new_status_output_with_rate_limits(
+        let model_display_name = self.model_display_name();
+        self.add_to_history(crate::status::new_status_output(
             &self.config,
             self.auth_manager.as_ref(),
             token_info,
@@ -4259,10 +4381,10 @@ impl ChatWidget {
             &self.thread_id,
             self.thread_name.clone(),
             self.forked_from,
-            rate_limit_snapshots.as_slice(),
+            self.rate_limit_snapshot.as_ref(),
             self.plan_type,
             Local::now(),
-            self.model_display_name(),
+            &model_display_name,
             collaboration_mode,
             reasoning_effort_override,
         ));
@@ -4377,7 +4499,7 @@ impl ChatWidget {
     /// git metadata.
     fn status_line_value_for_item(&self, item: &StatusLineItem) -> Option<String> {
         match item {
-            StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
+            StatusLineItem::ModelName => Some(self.model_display_name()),
             StatusLineItem::ModelWithReasoning => {
                 let label =
                     Self::status_line_reasoning_effort_label(self.effective_reasoning_effort());
@@ -4405,8 +4527,8 @@ impl ChatWidget {
                 .map(|used| format!("{used}% used")),
             StatusLineItem::FiveHourLimit => {
                 let window = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get("codex")
+                    .rate_limit_snapshot
+                    .as_ref()
                     .and_then(|s| s.primary.as_ref());
                 let label = window
                     .and_then(|window| window.window_minutes)
@@ -4416,8 +4538,8 @@ impl ChatWidget {
             }
             StatusLineItem::WeeklyLimit => {
                 let window = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get("codex")
+                    .rate_limit_snapshot
+                    .as_ref()
                     .and_then(|s| s.secondary.as_ref());
                 let label = window
                     .and_then(|window| window.window_minutes)
@@ -4601,10 +4723,9 @@ impl ChatWidget {
             loop {
                 if let Some(auth) = auth_manager.auth().await
                     && auth.is_chatgpt_auth()
+                    && let Some(snapshot) = fetch_rate_limits(base_url.clone(), auth).await
                 {
-                    for snapshot in fetch_rate_limits(base_url.clone(), auth).await {
-                        app_event_tx.send(AppEvent::RateLimitSnapshotFetched(snapshot));
-                    }
+                    app_event_tx.send(AppEvent::RateLimitSnapshotFetched(snapshot));
                 }
                 interval.tick().await;
             }
@@ -4872,7 +4993,7 @@ impl ChatWidget {
             .iter()
             .find(|preset| preset.model.as_str() == current_model)
             .map(|preset| preset.display_name.to_string())
-            .unwrap_or_else(|| self.model_display_name().to_string());
+            .unwrap_or_else(|| self.model_for_selection_popup());
 
         let (mut auto_presets, other_presets): (Vec<ModelPreset>, Vec<ModelPreset>) = presets
             .into_iter()
@@ -6090,6 +6211,13 @@ impl ChatWidget {
     }
 
     pub(crate) fn current_model(&self) -> &str {
+        if let Some(agent_model) = self
+            .active_named_agent
+            .as_ref()
+            .and_then(|agent| agent.model.as_deref())
+        {
+            return agent_model;
+        }
         if !self.collaboration_modes_enabled() {
             return self.current_collaboration_mode.model();
         }
@@ -6207,30 +6335,169 @@ impl ChatWidget {
             .unwrap_or(current_effort)
     }
 
-    fn effective_collaboration_mode(&self) -> CollaborationMode {
-        if !self.collaboration_modes_enabled() {
-            return self.current_collaboration_mode.clone();
+    fn active_named_agent_label(&self) -> Option<&str> {
+        self.active_named_agent
+            .as_ref()
+            .map(|agent| agent.name.as_str())
+    }
+
+    fn append_active_named_agent_prompt(
+        &self,
+        developer_instructions: Option<String>,
+        agent: &AgentDefinition,
+    ) -> Option<String> {
+        let prompt = agent.prompt.trim();
+        if prompt.is_empty() {
+            return developer_instructions;
         }
-        self.active_collaboration_mask.as_ref().map_or_else(
-            || self.current_collaboration_mode.clone(),
-            |mask| self.current_collaboration_mode.apply_mask(mask),
-        )
+
+        let agent_block = format!(
+            "<active_named_agent id=\"{id}\" name=\"{name}\">\n{prompt}\n</active_named_agent>",
+            id = agent.id,
+            name = agent.name
+        );
+        match developer_instructions {
+            Some(existing) if !existing.trim().is_empty() => {
+                Some(format!("{existing}\n\n{agent_block}"))
+            }
+            _ => Some(agent_block),
+        }
+    }
+
+    fn apply_active_named_agent(&self, collaboration_mode: CollaborationMode) -> CollaborationMode {
+        let settings = collaboration_mode.settings.clone();
+        let mut developer_instructions = settings.developer_instructions;
+        let profiles_with_prompt: Vec<&AgentDefinition> = self
+            .named_agents_registry
+            .iter()
+            .filter(|agent| !agent.prompt.trim().is_empty())
+            .collect();
+        if !profiles_with_prompt.is_empty() {
+            let active_agent_id = self
+                .active_named_agent
+                .as_ref()
+                .map(|agent| agent.id.as_str());
+            let mut lines = vec![
+                "<named_agents_registry>".to_string(),
+                "Delegation profiles available for sub-agents:".to_string(),
+                "If spawn_agent tools are available, delegate parallelizable tasks by copying the profile prompt into the delegated task.".to_string(),
+            ];
+            for agent in profiles_with_prompt
+                .iter()
+                .take(NAMED_AGENT_REGISTRY_MAX_ITEMS)
+            {
+                let description = agent
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(|description| {
+                        truncate_text(description, NAMED_AGENT_DESCRIPTION_PREVIEW_GRAPHEMES)
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                let active = if active_agent_id == Some(agent.id.as_str()) {
+                    "true"
+                } else {
+                    "false"
+                };
+                let prompt_preview =
+                    truncate_text(agent.prompt.trim(), NAMED_AGENT_PROMPT_PREVIEW_GRAPHEMES);
+                lines.push(format!(
+                    "- id: {id}\n  name: {name}\n  active: {active}\n  description: {description}\n  prompt: {prompt_preview}",
+                    id = agent.id,
+                    name = agent.name
+                ));
+            }
+            let omitted = profiles_with_prompt
+                .len()
+                .saturating_sub(NAMED_AGENT_REGISTRY_MAX_ITEMS);
+            if omitted > 0 {
+                lines.push(format!("- omitted_profiles: {omitted}"));
+            }
+            lines.push("</named_agents_registry>".to_string());
+            let registry_block = lines.join("\n");
+            developer_instructions = match developer_instructions {
+                Some(existing) if !existing.trim().is_empty() => {
+                    Some(format!("{existing}\n\n{registry_block}"))
+                }
+                _ => Some(registry_block),
+            };
+        }
+
+        let Some(agent) = self.active_named_agent.as_ref() else {
+            return CollaborationMode {
+                mode: collaboration_mode.mode,
+                settings: Settings {
+                    model: settings.model,
+                    reasoning_effort: settings.reasoning_effort,
+                    developer_instructions,
+                },
+            };
+        };
+        let model = agent
+            .model
+            .clone()
+            .unwrap_or_else(|| settings.model.clone());
+        let reasoning_effort = agent.reasoning_effort.or(settings.reasoning_effort);
+        let developer_instructions =
+            self.append_active_named_agent_prompt(developer_instructions, agent);
+
+        CollaborationMode {
+            mode: collaboration_mode.mode,
+            settings: Settings {
+                model,
+                reasoning_effort,
+                developer_instructions,
+            },
+        }
+    }
+
+    fn format_model_display_with_agent(&self, model: &str) -> String {
+        match self.active_named_agent_label() {
+            Some(label) if !label.is_empty() => format!("{model} [agent:{label}]"),
+            _ => model.to_string(),
+        }
+    }
+
+    fn effective_collaboration_mode(&self) -> CollaborationMode {
+        let collaboration_mode = if !self.collaboration_modes_enabled() {
+            self.current_collaboration_mode.clone()
+        } else {
+            self.active_collaboration_mask.as_ref().map_or_else(
+                || self.current_collaboration_mode.clone(),
+                |mask| self.current_collaboration_mode.apply_mask(mask),
+            )
+        };
+        self.apply_active_named_agent(collaboration_mode)
     }
 
     fn refresh_model_display(&mut self) {
         let effective = self.effective_collaboration_mode();
-        self.session_header.set_model(effective.model());
+        let model_display = self.format_model_display_with_agent(effective.model());
+        self.session_header.set_model(&model_display);
         // Keep composer paste affordances aligned with the currently effective model.
         self.sync_image_paste_enabled();
     }
 
-    fn model_display_name(&self) -> &str {
+    fn model_display_name(&self) -> String {
         let model = self.current_model();
-        if model.is_empty() {
-            DEFAULT_MODEL_DISPLAY_NAME
+        let model_display = if model.is_empty() {
+            DEFAULT_MODEL_DISPLAY_NAME.to_string()
         } else {
-            model
-        }
+            model.to_string()
+        };
+        self.format_model_display_with_agent(&model_display)
+    }
+
+    fn model_for_selection_popup(&self) -> String {
+        self.active_collaboration_mask
+            .as_ref()
+            .map_or_else(
+                || self.current_collaboration_mode.clone(),
+                |mask| self.current_collaboration_mode.apply_mask(mask),
+            )
+            .model()
+            .to_string()
     }
 
     /// Get the label for the current collaboration mode.
@@ -7022,6 +7289,13 @@ impl ChatWidget {
         };
         let mut flex = FlexRenderable::new();
         flex.push(1, active_cell_renderable);
+        if let Some(progress_board) = collab::progress_board(self.collab_progress_board.summary()) {
+            let progress_board: Box<dyn HistoryCell> = Box::new(progress_board);
+            flex.push(
+                0,
+                RenderableItem::Owned(progress_board.into()).inset(Insets::tlbr(1, 0, 0, 0)),
+            );
+        }
         flex.push(
             0,
             RenderableItem::Borrowed(&self.bottom_pane).inset(Insets::tlbr(1, 0, 0, 0)),
@@ -7170,18 +7444,18 @@ fn extract_first_bold(s: &str) -> Option<String> {
     None
 }
 
-async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {
+async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Option<RateLimitSnapshot> {
     match BackendClient::from_auth(base_url, &auth) {
-        Ok(client) => match client.get_rate_limits_many().await {
-            Ok(snapshots) => snapshots,
+        Ok(client) => match client.get_rate_limits().await {
+            Ok(snapshot) => Some(snapshot),
             Err(err) => {
                 debug!(error = ?err, "failed to fetch rate limits from /usage");
-                Vec::new()
+                None
             }
         },
         Err(err) => {
             debug!(error = ?err, "failed to construct backend client for rate limits");
-            Vec::new()
+            None
         }
     }
 }

@@ -9,6 +9,7 @@ use super::selection_popup_common::render_rows;
 use super::slash_commands;
 use crate::render::Insets;
 use crate::render::RectExt;
+use crate::slash_command::CommandDescriptionLanguage;
 use crate::slash_command::SlashCommand;
 use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
@@ -32,6 +33,7 @@ pub(crate) struct CommandPopup {
     builtins: Vec<(&'static str, SlashCommand)>,
     prompts: Vec<CustomPrompt>,
     state: ScrollState,
+    description_language: CommandDescriptionLanguage,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +62,7 @@ impl CommandPopup {
             builtins,
             prompts,
             state: ScrollState::new(),
+            description_language: CommandDescriptionLanguage::English,
         }
     }
 
@@ -72,6 +75,10 @@ impl CommandPopup {
         prompts.retain(|p| !exclude.contains(&p.name));
         prompts.sort_by(|a, b| a.name.cmp(&b.name));
         self.prompts = prompts;
+    }
+
+    pub(crate) fn set_description_language(&mut self, language: CommandDescriptionLanguage) {
+        self.description_language = language;
     }
 
     pub(crate) fn prompt(&self, idx: usize) -> Option<&CustomPrompt> {
@@ -200,9 +207,10 @@ impl CommandPopup {
             .into_iter()
             .map(|(item, indices)| {
                 let (name, description) = match item {
-                    CommandItem::Builtin(cmd) => {
-                        (format!("/{}", cmd.command()), cmd.description().to_string())
-                    }
+                    CommandItem::Builtin(cmd) => (
+                        format!("/{}", cmd.command()),
+                        cmd.description_in(self.description_language).to_string(),
+                    ),
                     CommandItem::UserPrompt(i) => {
                         let prompt = &self.prompts[i];
                         let description = prompt
@@ -565,5 +573,18 @@ mod tests {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "personality"),
             other => panic!("expected personality to be selected for exact match, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn builtin_description_respects_selected_language() {
+        let mut popup = CommandPopup::new(Vec::new(), CommandPopupFlags::default());
+        popup.set_description_language(CommandDescriptionLanguage::Korean);
+        let rows =
+            popup.rows_from_matches(vec![(CommandItem::Builtin(SlashCommand::Status), None)]);
+        let description = rows.first().and_then(|row| row.description.as_deref());
+        assert_eq!(
+            description,
+            Some("현재 세션 설정과 토큰 사용량을 표시합니다")
+        );
     }
 }

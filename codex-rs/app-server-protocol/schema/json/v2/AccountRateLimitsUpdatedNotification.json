@@ -48,18 +48,6 @@
             }
           ]
         },
-        "limitId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "limitName": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "planType": {
           "anyOf": [
             {

@@ -1,5 +1,7 @@
 use crate::AuthManager;
+#[cfg(any(test, feature = "test-support"))]
 use crate::CodexAuth;
+#[cfg(any(test, feature = "test-support"))]
 use crate::ModelProviderInfo;
 use crate::agent::AgentControl;
 use crate::codex::Codex;
@@ -29,50 +31,25 @@ use codex_protocol::protocol::SessionSource;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+#[cfg(any(test, feature = "test-support"))]
+use tempfile::TempDir;
 use tokio::runtime::Handle;
+#[cfg(any(test, feature = "test-support"))]
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
-/// Test-only override for enabling thread-manager behaviors used by integration
-/// tests.
-///
-/// In production builds this value should remain at its default (`false`) and
-/// must not be toggled.
-static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
-
-type CapturedOps = Vec<(ThreadId, Op)>;
-type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
-
-pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
-    FORCE_TEST_THREAD_MANAGER_BEHAVIOR.store(enabled, Ordering::Relaxed);
-}
-
-fn should_use_test_thread_manager_behavior() -> bool {
-    FORCE_TEST_THREAD_MANAGER_BEHAVIOR.load(Ordering::Relaxed)
-}
-
-struct TempCodexHomeGuard {
-    path: PathBuf,
-}
-
-impl Drop for TempCodexHomeGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 fn build_file_watcher(codex_home: PathBuf, skills_manager: Arc<SkillsManager>) -> Arc<FileWatcher> {
-    if should_use_test_thread_manager_behavior()
-        && let Ok(handle) = Handle::try_current()
+    #[cfg(any(test, feature = "test-support"))]
+    if let Ok(handle) = Handle::try_current()
         && handle.runtime_flavor() == RuntimeFlavor::CurrentThread
     {
         // The real watcher spins background tasks that can starve the
         // current-thread test runtime and cause event waits to time out.
+        // Integration tests compile with the `test-support` feature.
         warn!("using noop file watcher under current-thread test runtime");
         return Arc::new(FileWatcher::noop());
     }
@@ -118,7 +95,8 @@ pub struct NewThread {
 /// them in memory.
 pub struct ThreadManager {
     state: Arc<ThreadManagerState>,
-    _test_codex_home_guard: Option<TempCodexHomeGuard>,
+    #[cfg(any(test, feature = "test-support"))]
+    _test_codex_home_guard: Option<TempDir>,
 }
 
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
@@ -132,8 +110,10 @@ pub(crate) struct ThreadManagerState {
     skills_manager: Arc<SkillsManager>,
     file_watcher: Arc<FileWatcher>,
     session_source: SessionSource,
-    // Captures submitted ops for testing purpose when test mode is enabled.
-    ops_log: Option<SharedCapturedOps>,
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    // Captures submitted ops for testing purpose.
+    ops_log: Arc<std::sync::Mutex<Vec<(ThreadId, Op)>>>,
 }
 
 impl ThreadManager {
@@ -154,40 +134,33 @@ impl ThreadManager {
                 file_watcher,
                 auth_manager,
                 session_source,
-                ops_log: should_use_test_thread_manager_behavior()
-                    .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+                #[cfg(any(test, feature = "test-support"))]
+                ops_log: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
+            #[cfg(any(test, feature = "test-support"))]
             _test_codex_home_guard: None,
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Construct with a dummy AuthManager containing the provided CodexAuth.
     /// Used for integration tests: should not be used by ordinary business logic.
-    pub(crate) fn with_models_provider_for_tests(
-        auth: CodexAuth,
-        provider: ModelProviderInfo,
-    ) -> Self {
-        set_thread_manager_test_mode_for_tests(true);
-        let codex_home = std::env::temp_dir().join(format!(
-            "codex-thread-manager-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&codex_home)
-            .unwrap_or_else(|err| panic!("temp codex home dir create failed: {err}"));
-        let mut manager =
-            Self::with_models_provider_and_home_for_tests(auth, provider, codex_home.clone());
-        manager._test_codex_home_guard = Some(TempCodexHomeGuard { path: codex_home });
+    pub fn with_models_provider(auth: CodexAuth, provider: ModelProviderInfo) -> Self {
+        let temp_dir = tempfile::tempdir().unwrap_or_else(|err| panic!("temp codex home: {err}"));
+        let codex_home = temp_dir.path().to_path_buf();
+        let mut manager = Self::with_models_provider_and_home(auth, provider, codex_home);
+        manager._test_codex_home_guard = Some(temp_dir);
         manager
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Construct with a dummy AuthManager containing the provided CodexAuth and codex home.
     /// Used for integration tests: should not be used by ordinary business logic.
-    pub(crate) fn with_models_provider_and_home_for_tests(
+    pub fn with_models_provider_and_home(
         auth: CodexAuth,
         provider: ModelProviderInfo,
         codex_home: PathBuf,
     ) -> Self {
-        set_thread_manager_test_mode_for_tests(true);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let skills_manager = Arc::new(SkillsManager::new(codex_home.clone()));
@@ -196,7 +169,7 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
-                models_manager: Arc::new(ModelsManager::with_provider_for_tests(
+                models_manager: Arc::new(ModelsManager::with_provider(
                     codex_home,
                     auth_manager.clone(),
                     provider,
@@ -205,8 +178,8 @@ impl ThreadManager {
                 file_watcher,
                 auth_manager,
                 session_source: SessionSource::Exec,
-                ops_log: should_use_test_thread_manager_behavior()
-                    .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+                #[cfg(any(test, feature = "test-support"))]
+                ops_log: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
             _test_codex_home_guard: None,
         }
@@ -367,12 +340,13 @@ impl ThreadManager {
         AgentControl::new(Arc::downgrade(&self.state))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
     pub(crate) fn captured_ops(&self) -> Vec<(ThreadId, Op)> {
         self.state
             .ops_log
-            .as_ref()
-            .and_then(|ops_log| ops_log.lock().ok().map(|log| log.clone()))
+            .lock()
+            .map(|log| log.clone())
             .unwrap_or_default()
     }
 }
@@ -390,10 +364,11 @@ impl ThreadManagerState {
     /// Send an operation to a thread by ID.
     pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> CodexResult<String> {
         let thread = self.get_thread(thread_id).await?;
-        if let Some(ops_log) = &self.ops_log
-            && let Ok(mut log) = ops_log.lock()
+        #[cfg(any(test, feature = "test-support"))]
         {
-            log.push((thread_id, op.clone()));
+            if let Ok(mut log) = self.ops_log.lock() {
+                log.push((thread_id, op.clone()));
+            }
         }
         thread.submit(op).await
     }

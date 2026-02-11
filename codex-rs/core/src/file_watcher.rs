@@ -24,6 +24,7 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::skills::loader::skill_roots_from_layer_stack_with_agents;
+use crate::skills::loader::user_home_for_agents_skills;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileWatcherEvent {
@@ -131,8 +132,12 @@ impl FileWatcher {
     }
 
     pub(crate) fn register_config(&self, config: &Config) {
-        let roots =
-            skill_roots_from_layer_stack_with_agents(&config.config_layer_stack, &config.cwd);
+        let user_home = user_home_for_agents_skills(&config.codex_home);
+        let roots = skill_roots_from_layer_stack_with_agents(
+            &config.config_layer_stack,
+            &config.cwd,
+            user_home.as_deref(),
+        );
         for root in roots {
             self.register_skills_root(root.path);
         }

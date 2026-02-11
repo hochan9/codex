@@ -236,7 +236,17 @@ fn skill_roots_from_layer_stack_inner(
 }
 
 fn skill_roots(config: &Config) -> Vec<SkillRoot> {
-    skill_roots_from_layer_stack_with_agents(&config.config_layer_stack, &config.cwd)
+    let user_home = user_home_for_agents_skills(&config.codex_home);
+    skill_roots_from_layer_stack_with_agents(
+        &config.config_layer_stack,
+        &config.cwd,
+        user_home.as_deref(),
+    )
+}
+
+pub(crate) fn user_home_for_agents_skills(codex_home: &Path) -> Option<PathBuf> {
+    let home = home_dir()?;
+    codex_home.starts_with(&home).then_some(home)
 }
 
 #[cfg(test)]
@@ -250,8 +260,9 @@ pub(crate) fn skill_roots_from_layer_stack(
 pub(crate) fn skill_roots_from_layer_stack_with_agents(
     config_layer_stack: &ConfigLayerStack,
     cwd: &Path,
+    home_dir: Option<&Path>,
 ) -> Vec<SkillRoot> {
-    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir().as_deref());
+    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir);
     roots.extend(repo_agents_skill_roots(config_layer_stack, cwd));
     dedupe_skill_roots_by_path(&mut roots);
     roots
@@ -2333,10 +2344,11 @@ policy: {}
             .into_iter()
             .map(|root| root.scope)
             .collect();
-        let mut expected = vec![SkillScope::User, SkillScope::System];
-        if home_dir().is_some() {
-            expected.insert(1, SkillScope::User);
+        let mut expected = vec![SkillScope::User];
+        if user_home_for_agents_skills(&cfg.codex_home).is_some() {
+            expected.push(SkillScope::User);
         }
+        expected.push(SkillScope::System);
         expected.push(SkillScope::Admin);
         assert_eq!(scopes, expected);
     }

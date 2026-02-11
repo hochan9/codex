@@ -113,6 +113,11 @@ which = { workspace = true }
 wildmatch = { workspace = true }
 zip = { workspace = true }
 
+[features]
+deterministic_process_ids = []
+test-support = []
+
+
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["linux-native-async-persistent"] }
 landlock = { workspace = true }
@@ -145,6 +150,9 @@ keyring = { workspace = true, features = ["sync-secret-service"] }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
 codex-arg0 = { workspace = true }
+codex-core = { path = ".", default-features = false, features = [
+    "deterministic_process_ids",
+] }
 codex-otel = { workspace = true, features = [
     "disable-default-metrics-exporter",
 ] }

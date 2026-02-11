@@ -6,7 +6,6 @@ use tokio::time::timeout;
 
 /// Regression test for https://github.com/openai/codex/issues/8803.
 #[tokio::test]
-#[ignore = "TODO(mbolin): flaky"]
 async fn malformed_rules_should_not_panic() -> anyhow::Result<()> {
     // run_codex_cli() does not work on Windows due to PTY limitations.
     if cfg!(windows) {
@@ -27,6 +26,9 @@ async fn malformed_rules_should_not_panic() -> anyhow::Result<()> {
         r#"
 # Pick a local provider so the CLI doesn't prompt for OpenAI auth in this test.
 model_provider = "ollama"
+
+[notice.model_migrations]
+"gpt-5.2-codex" = "gpt-5.3-codex"
 
 [projects]
 "{cwd}" = {{ trust_level = "trusted" }}

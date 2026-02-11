@@ -150,6 +150,7 @@ use crate::bottom_pane::prompt_args::prompt_has_numeric_placeholders;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::render::renderable::Renderable;
+use crate::slash_command::CommandDescriptionLanguage;
 use crate::slash_command::SlashCommand;
 use crate::style::user_message_style;
 use codex_common::fuzzy_match::fuzzy_match;
@@ -307,6 +308,7 @@ pub(crate) struct ChatComposer {
     connectors_enabled: bool,
     personality_command_enabled: bool,
     windows_degraded_sandbox_active: bool,
+    command_description_language: CommandDescriptionLanguage,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
 }
@@ -405,6 +407,7 @@ impl ChatComposer {
             connectors_enabled: false,
             personality_command_enabled: false,
             windows_degraded_sandbox_active: false,
+            command_description_language: CommandDescriptionLanguage::English,
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -476,6 +479,14 @@ impl ChatComposer {
     pub fn set_personality_command_enabled(&mut self, enabled: bool) {
         self.personality_command_enabled = enabled;
     }
+
+    pub fn set_command_description_language(&mut self, language: CommandDescriptionLanguage) {
+        self.command_description_language = language;
+        if let ActivePopup::Command(popup) = &mut self.active_popup {
+            popup.set_description_language(language);
+        }
+    }
+
     /// Centralized feature gating keeps config checks out of call sites.
     fn popups_enabled(&self) -> bool {
         self.config.popups_enabled
@@ -2990,6 +3001,7 @@ impl ChatComposer {
                             windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
                         },
                     );
+                    command_popup.set_description_language(self.command_description_language);
                     command_popup.on_composer_text_change(first_line.to_string());
                     self.active_popup = ActivePopup::Command(command_popup);
                 }

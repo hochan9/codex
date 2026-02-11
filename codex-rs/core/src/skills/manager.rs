@@ -19,6 +19,7 @@ use crate::skills::SkillLoadOutcome;
 use crate::skills::loader::SkillRoot;
 use crate::skills::loader::load_skills_from_roots;
 use crate::skills::loader::skill_roots_from_layer_stack_with_agents;
+use crate::skills::loader::user_home_for_agents_skills;
 use crate::skills::system::install_system_skills;
 
 pub struct SkillsManager {
@@ -46,8 +47,12 @@ impl SkillsManager {
             return outcome;
         }
 
-        let roots =
-            skill_roots_from_layer_stack_with_agents(&config.config_layer_stack, &config.cwd);
+        let user_home = user_home_for_agents_skills(&config.codex_home);
+        let roots = skill_roots_from_layer_stack_with_agents(
+            &config.config_layer_stack,
+            &config.cwd,
+            user_home.as_deref(),
+        );
         let mut outcome = load_skills_from_roots(roots);
         outcome.disabled_paths = disabled_paths_from_stack(&config.config_layer_stack);
         let mut cache = match self.cache_by_cwd.write() {
@@ -113,7 +118,12 @@ impl SkillsManager {
             }
         };
 
-        let mut roots = skill_roots_from_layer_stack_with_agents(&config_layer_stack, cwd);
+        let user_home = user_home_for_agents_skills(&self.codex_home);
+        let mut roots = skill_roots_from_layer_stack_with_agents(
+            &config_layer_stack,
+            cwd,
+            user_home.as_deref(),
+        );
         roots.extend(
             normalized_extra_user_roots
                 .iter()

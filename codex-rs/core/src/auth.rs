@@ -981,8 +981,9 @@ impl AuthManager {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Create an AuthManager with a specific CodexAuth, for testing only.
-    pub(crate) fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
+    pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
         let cached = CachedAuth {
             auth: Some(auth),
             external_refresher: None,
@@ -997,11 +998,9 @@ impl AuthManager {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Create an AuthManager with a specific CodexAuth and codex home, for testing only.
-    pub(crate) fn from_auth_for_testing_with_home(
-        auth: CodexAuth,
-        codex_home: PathBuf,
-    ) -> Arc<Self> {
+    pub fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self> {
         let cached = CachedAuth {
             auth: Some(auth),
             external_refresher: None,

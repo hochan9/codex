@@ -395,10 +395,13 @@ impl<'a> Renderable for InsetRenderable<'a> {
         self.child.render(area.inset(self.insets), buf);
     }
     fn desired_height(&self, width: u16) -> u16 {
+        let inner_width = width
+            .saturating_sub(self.insets.left)
+            .saturating_sub(self.insets.right);
         self.child
-            .desired_height(width - self.insets.left - self.insets.right)
-            + self.insets.top
-            + self.insets.bottom
+            .desired_height(inner_width)
+            .saturating_add(self.insets.top)
+            .saturating_add(self.insets.bottom)
     }
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.child.cursor_pos(area.inset(self.insets))
@@ -426,5 +429,34 @@ where
         let child: RenderableItem<'a> =
             RenderableItem::Owned(Box::new(self) as Box<dyn Renderable + 'a>);
         RenderableItem::Owned(Box::new(InsetRenderable { child, insets }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct FixedHeight(u16);
+
+    impl Renderable for FixedHeight {
+        fn render(&self, _area: Rect, _buf: &mut Buffer) {}
+
+        fn desired_height(&self, _width: u16) -> u16 {
+            self.0
+        }
+
+        fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
+            None
+        }
+    }
+
+    #[test]
+    fn inset_desired_height_saturates_narrow_width() {
+        let renderable = InsetRenderable::new(
+            RenderableItem::Owned(Box::new(FixedHeight(2))),
+            Insets::tlbr(1, 2, 1, 2),
+        );
+        assert_eq!(renderable.desired_height(1), 4);
     }
 }

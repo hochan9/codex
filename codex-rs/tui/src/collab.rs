@@ -14,10 +14,215 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProgressBoard {
+    pending_spawn_calls: HashSet<String>,
+    queued_workers: HashSet<ThreadId>,
+    active_workers: HashSet<ThreadId>,
+    done_workers: HashMap<ThreadId, AgentStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProgressSummary {
+    pub(crate) active_count: usize,
+    pub(crate) queued_count: usize,
+    pub(crate) pending_spawn_calls: usize,
+    pub(crate) done_count: usize,
+    pub(crate) completed_count: usize,
+    pub(crate) errored_count: usize,
+    pub(crate) shutdown_count: usize,
+    pub(crate) not_found_count: usize,
+}
+
+impl ProgressSummary {
+    pub(crate) fn is_empty(self) -> bool {
+        self.active_count == 0 && self.queued_count == 0 && self.done_count == 0
+    }
+}
+
+impl ProgressBoard {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn on_spawn_begin(&mut self, call_id: String) {
+        self.pending_spawn_calls.insert(call_id);
+    }
+
+    pub(crate) fn on_spawn_end(
+        &mut self,
+        call_id: &str,
+        new_thread_id: Option<ThreadId>,
+        status: &AgentStatus,
+    ) {
+        self.pending_spawn_calls.remove(call_id);
+        if let Some(thread_id) = new_thread_id {
+            self.record_status(thread_id, status.clone());
+        }
+    }
+
+    pub(crate) fn on_interaction_end(
+        &mut self,
+        receiver_thread_id: ThreadId,
+        status: &AgentStatus,
+    ) {
+        self.record_status(receiver_thread_id, status.clone());
+    }
+
+    pub(crate) fn on_wait_begin(&mut self, receiver_thread_ids: &[ThreadId]) {
+        for receiver_thread_id in receiver_thread_ids {
+            if self.done_workers.contains_key(receiver_thread_id) {
+                continue;
+            }
+            self.active_workers.remove(receiver_thread_id);
+            self.queued_workers.insert(*receiver_thread_id);
+        }
+    }
+
+    pub(crate) fn on_wait_end(&mut self, statuses: &HashMap<ThreadId, AgentStatus>) {
+        for (receiver_thread_id, status) in statuses {
+            self.queued_workers.remove(receiver_thread_id);
+            self.record_status(*receiver_thread_id, status.clone());
+        }
+    }
+
+    pub(crate) fn on_close_end(&mut self, receiver_thread_id: ThreadId) {
+        self.queued_workers.remove(&receiver_thread_id);
+        self.active_workers.remove(&receiver_thread_id);
+        self.done_workers
+            .insert(receiver_thread_id, AgentStatus::Shutdown);
+    }
+
+    pub(crate) fn on_resume_begin(&mut self, receiver_thread_id: ThreadId) {
+        if self.done_workers.contains_key(&receiver_thread_id) {
+            return;
+        }
+        self.active_workers.remove(&receiver_thread_id);
+        self.queued_workers.insert(receiver_thread_id);
+    }
+
+    pub(crate) fn on_resume_end(&mut self, receiver_thread_id: ThreadId, status: &AgentStatus) {
+        self.queued_workers.remove(&receiver_thread_id);
+        self.record_status(receiver_thread_id, status.clone());
+    }
+
+    pub(crate) fn summary(&self) -> ProgressSummary {
+        let mut completed_count = 0usize;
+        let mut errored_count = 0usize;
+        let mut shutdown_count = 0usize;
+        let mut not_found_count = 0usize;
+        for status in self.done_workers.values() {
+            match status {
+                AgentStatus::Completed(_) => completed_count += 1,
+                AgentStatus::Errored(_) => errored_count += 1,
+                AgentStatus::Shutdown => shutdown_count += 1,
+                AgentStatus::NotFound => not_found_count += 1,
+                AgentStatus::PendingInit | AgentStatus::Running => {}
+            }
+        }
+        ProgressSummary {
+            active_count: self.active_workers.len(),
+            queued_count: self.queued_workers.len() + self.pending_spawn_calls.len(),
+            pending_spawn_calls: self.pending_spawn_calls.len(),
+            done_count: self.done_workers.len(),
+            completed_count,
+            errored_count,
+            shutdown_count,
+            not_found_count,
+        }
+    }
+
+    fn record_status(&mut self, receiver_thread_id: ThreadId, status: AgentStatus) {
+        self.queued_workers.remove(&receiver_thread_id);
+        self.active_workers.remove(&receiver_thread_id);
+        if is_terminal_status(&status) {
+            self.done_workers.insert(receiver_thread_id, status);
+            return;
+        }
+        self.done_workers.remove(&receiver_thread_id);
+        match status {
+            AgentStatus::PendingInit => {
+                self.queued_workers.insert(receiver_thread_id);
+            }
+            AgentStatus::Running => {
+                self.active_workers.insert(receiver_thread_id);
+            }
+            AgentStatus::Completed(_)
+            | AgentStatus::Errored(_)
+            | AgentStatus::Shutdown
+            | AgentStatus::NotFound => {}
+        }
+    }
+}
+
+pub(crate) fn progress_board(summary: ProgressSummary) -> Option<PlainHistoryCell> {
+    if summary.is_empty() {
+        return None;
+    }
+
+    let active_line = detail_line_spans(
+        "active",
+        vec![
+            Span::from(summary.active_count.to_string()).cyan().bold(),
+            Span::from(" workers").dim(),
+        ],
+    );
+    let mut queued_spans = vec![
+        Span::from(summary.queued_count.to_string())
+            .magenta()
+            .bold(),
+        Span::from(" workers").dim(),
+    ];
+    if summary.pending_spawn_calls > 0 {
+        queued_spans.push(Span::from(" · ").dim());
+        queued_spans
+            .push(Span::from(format!("{} spawn pending", summary.pending_spawn_calls)).dim());
+    }
+    let queued_line = detail_line_spans("queued", queued_spans);
+
+    let mut done_spans = vec![
+        Span::from(summary.done_count.to_string()).green().bold(),
+        Span::from(" workers").dim(),
+    ];
+    push_status_count(
+        &mut done_spans,
+        summary.completed_count,
+        "completed",
+        ratatui::prelude::Stylize::green,
+    );
+    push_status_count(
+        &mut done_spans,
+        summary.errored_count,
+        "errored",
+        ratatui::prelude::Stylize::red,
+    );
+    push_status_count(
+        &mut done_spans,
+        summary.shutdown_count,
+        "shutdown",
+        ratatui::prelude::Stylize::dim,
+    );
+    push_status_count(
+        &mut done_spans,
+        summary.not_found_count,
+        "not found",
+        ratatui::prelude::Stylize::red,
+    );
+    let done_line = detail_line_spans("done", done_spans);
+
+    Some(PlainHistoryCell::new(vec![
+        vec!["Sub-agent board".cyan().bold()].into(),
+        active_line,
+        queued_line,
+        done_line,
+    ]))
+}
 
 pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
     let CollabAgentSpawnEndEvent {
@@ -292,4 +497,98 @@ fn detail_line_spans(label: &str, mut value: Vec<Span<'static>>) -> Line<'static
     spans.push(Span::from(format!("{label}: ")).dim());
     spans.append(&mut value);
     spans.into()
+}
+
+fn is_terminal_status(status: &AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Completed(_)
+            | AgentStatus::Errored(_)
+            | AgentStatus::Shutdown
+            | AgentStatus::NotFound
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn progress_board_tracks_spawn_wait_and_completion() {
+        let mut board = ProgressBoard::default();
+        let worker = ThreadId::new();
+
+        board.on_spawn_begin("spawn-1".to_string());
+        assert_eq!(
+            board.summary(),
+            ProgressSummary {
+                queued_count: 1,
+                pending_spawn_calls: 1,
+                ..ProgressSummary::default()
+            }
+        );
+
+        board.on_spawn_end("spawn-1", Some(worker), &AgentStatus::PendingInit);
+        assert_eq!(
+            board.summary(),
+            ProgressSummary {
+                queued_count: 1,
+                ..ProgressSummary::default()
+            }
+        );
+
+        board.on_interaction_end(worker, &AgentStatus::Running);
+        assert_eq!(
+            board.summary(),
+            ProgressSummary {
+                active_count: 1,
+                ..ProgressSummary::default()
+            }
+        );
+
+        board.on_wait_begin(&[worker]);
+        assert_eq!(
+            board.summary(),
+            ProgressSummary {
+                queued_count: 1,
+                ..ProgressSummary::default()
+            }
+        );
+
+        let mut statuses = HashMap::new();
+        statuses.insert(worker, AgentStatus::Completed(Some("ok".to_string())));
+        board.on_wait_end(&statuses);
+        assert_eq!(
+            board.summary(),
+            ProgressSummary {
+                done_count: 1,
+                completed_count: 1,
+                ..ProgressSummary::default()
+            }
+        );
+    }
+
+    #[test]
+    fn progress_board_handles_close_as_shutdown() {
+        let mut board = ProgressBoard::default();
+        let worker = ThreadId::new();
+
+        board.on_interaction_end(worker, &AgentStatus::Running);
+        board.on_close_end(worker);
+
+        assert_eq!(
+            board.summary(),
+            ProgressSummary {
+                done_count: 1,
+                shutdown_count: 1,
+                ..ProgressSummary::default()
+            }
+        );
+    }
+
+    #[test]
+    fn progress_board_render_returns_none_when_empty() {
+        assert!(progress_board(ProgressSummary::default()).is_none());
+    }
 }

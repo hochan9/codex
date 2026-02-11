@@ -5,6 +5,7 @@
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod agents_store;
 mod analytics_client;
 pub mod api_bridge;
 mod apply_patch;
@@ -59,7 +60,6 @@ mod session_prefix;
 mod shell_detect;
 mod stream_events_utils;
 mod tagged_block_parser;
-pub mod test_support;
 mod text_encoding;
 pub mod token_data;
 mod truncate;

@@ -34,6 +34,9 @@ cargo build
 
 # Launch the TUI with a sample prompt.
 cargo run --bin codex -- "explain this codebase to me"
+# Alias binaries are also available:
+cargo run --bin sub-codex -- "explain this codebase to me"
+cargo run --bin codex-agent -- "explain this codebase to me"
 
 # After making changes, use the root justfile helpers (they default to codex-rs):
 just fmt
@@ -45,6 +48,32 @@ cargo test -p codex-tui
 just test
 # If you specifically want the full `--all-features` matrix, use:
 cargo test --all-features
+```
+
+### Run `sub-codex` without installing globally
+
+If you do not want `npm install -g` / Homebrew / `cargo install`, run the alias binary directly from this repository.
+For a bilingual (KR/EN) guide with a session change summary, see [`sub-codex-local-guide.md`](./sub-codex-local-guide.md).
+For a Korean user-facing guide focused on TUI/sub-agent usage, see [`sub-agent-user-guide.md`](./sub-agent-user-guide.md).
+
+```bash
+# From the repository root:
+cd codex
+
+# One-off run (build + execute):
+cargo run --manifest-path codex-rs/Cargo.toml --bin sub-codex -- "explain this codebase"
+
+# Or prebuild once, then execute the local binary:
+cargo build --manifest-path codex-rs/Cargo.toml --bin sub-codex
+./codex-rs/target/debug/sub-codex "explain this codebase"
+```
+
+If you want a convenient local command without installing globally, add a shell function:
+
+```bash
+sub-codex() {
+  cargo run --manifest-path /absolute/path/to/codex/codex-rs/Cargo.toml --bin sub-codex -- "$@"
+}
 ```
 
 ## Tracing / verbose logging

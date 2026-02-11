@@ -6,6 +6,8 @@ use crate::config::Config;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
+use crate::state::CollabDelegationIntent;
+use crate::state::CollabDelegationPolicy;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -38,6 +40,9 @@ pub struct CollabHandler;
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 300_000;
+const WAIT_TIMEOUT_ROUNDS_BEFORE_CLOSE_STALLED_WORKERS: usize = 2;
+const MAX_SPAWN_ATTEMPTS_PER_CALL: usize = 3;
+const SPAWN_RETRY_BACKOFF_MS: u64 = 250;
 
 #[derive(Debug, Deserialize)]
 struct CloseAgentArgs {
@@ -116,9 +121,13 @@ mod spawn {
         let agent_role = args.agent_type.unwrap_or(AgentRole::Default);
         let input_items = parse_collab_input(args.message, args.items)?;
         let prompt = input_preview(&input_items);
+        let hard_worker_limit = turn.config.agent_max_threads.unwrap_or(1).max(1);
+        let _policy =
+            reserve_spawn_budget(&session, &turn, &call_id, &prompt, hard_worker_limit).await?;
         let session_source = turn.session_source.clone();
         let child_depth = next_thread_spawn_depth(&session_source);
         if exceeds_thread_spawn_depth_limit(child_depth) {
+            mark_spawn_failed(&session, &turn, &call_id).await;
             return Err(FunctionCallError::RespondToModel(
                 "Agent depth limit reached. Solve the task yourself.".to_string(),
             ));
@@ -143,16 +152,42 @@ mod spawn {
             .apply_to_config(&mut config)
             .map_err(FunctionCallError::RespondToModel)?;
 
-        let result = session
-            .services
-            .agent_control
-            .spawn_agent(
-                config,
-                input_items,
-                Some(thread_spawn_source(session.conversation_id, child_depth)),
-            )
-            .await
-            .map_err(collab_spawn_error);
+        let result: Result<ThreadId, CodexErr> = loop {
+            let attempt = next_spawn_attempt(&session, &turn, &call_id).await;
+            let spawn_result = session
+                .services
+                .agent_control
+                .spawn_agent(
+                    config.clone(),
+                    input_items.clone(),
+                    Some(thread_spawn_source(session.conversation_id, child_depth)),
+                )
+                .await;
+            match spawn_result {
+                Ok(thread_id) => {
+                    mark_spawn_success(&session, &turn, &call_id, thread_id).await;
+                    break Ok(thread_id);
+                }
+                Err(err) => {
+                    if err.is_retryable() && attempt < MAX_SPAWN_ATTEMPTS_PER_CALL {
+                        tracing::debug!(
+                            call_id = %call_id,
+                            attempt,
+                            error = %err,
+                            "retrying spawn_agent after retryable failure"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            attempt as u64 * SPAWN_RETRY_BACKOFF_MS,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    mark_spawn_failed(&session, &turn, &call_id).await;
+                    break Err(err);
+                }
+            }
+        };
+        let result = result.map_err(collab_spawn_error);
         let (new_thread_id, status) = match &result {
             Ok(thread_id) => (
                 Some(*thread_id),
@@ -186,6 +221,104 @@ mod spawn {
             body: FunctionCallOutputBody::Text(content),
             success: Some(true),
         })
+    }
+
+    async fn reserve_spawn_budget(
+        session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
+        call_id: &str,
+        prompt: &str,
+        hard_worker_limit: usize,
+    ) -> Result<CollabDelegationPolicy, FunctionCallError> {
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Ok(default_policy(hard_worker_limit));
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return Ok(default_policy(hard_worker_limit));
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        let policy = turn_state.ensure_collab_policy(prompt, hard_worker_limit);
+        if turn_state.collab_worker_budget_exhausted() {
+            let (hard_limit, used_workers) = turn_state.collab_worker_budget();
+            return Err(FunctionCallError::RespondToModel(format!(
+                "delegation policy denied spawn_agent: worker budget exhausted ({used_workers}/{hard_limit} in use, intent={}, recommended_workers={}). Continue serially or reuse existing workers.",
+                format_policy_intent(policy.intent),
+                policy.recommended_workers
+            )));
+        }
+        turn_state.mark_collab_spawn_pending(call_id.to_string());
+        Ok(policy)
+    }
+
+    async fn next_spawn_attempt(
+        session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
+        call_id: &str,
+    ) -> usize {
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return 1;
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return 1;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.next_collab_spawn_attempt(call_id)
+    }
+
+    async fn mark_spawn_success(
+        session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
+        call_id: &str,
+        thread_id: ThreadId,
+    ) {
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.mark_collab_spawn_succeeded(call_id, thread_id);
+    }
+
+    async fn mark_spawn_failed(session: &Arc<Session>, turn: &Arc<TurnContext>, call_id: &str) {
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.mark_collab_spawn_failed(call_id);
+    }
+
+    fn default_policy(hard_worker_limit: usize) -> CollabDelegationPolicy {
+        if hard_worker_limit <= 1 {
+            CollabDelegationPolicy {
+                intent: CollabDelegationIntent::SingleAgent,
+                hard_worker_limit: 1,
+                recommended_workers: 1,
+                signals: vec!["fallback"],
+            }
+        } else {
+            CollabDelegationPolicy {
+                intent: CollabDelegationIntent::MultiAgent,
+                hard_worker_limit,
+                recommended_workers: hard_worker_limit,
+                signals: vec!["fallback"],
+            }
+        }
+    }
+
+    fn format_policy_intent(intent: CollabDelegationIntent) -> &'static str {
+        match intent {
+            CollabDelegationIntent::SingleAgent => "single_agent",
+            CollabDelegationIntent::MultiAgent => "multi_agent",
+        }
     }
 }
 
@@ -438,12 +571,21 @@ mod wait {
     struct WaitArgs {
         ids: Vec<String>,
         timeout_ms: Option<i64>,
+        timeout_fallback: Option<WaitTimeoutFallback>,
     }
 
     #[derive(Debug, Serialize)]
     struct WaitResult {
         status: HashMap<ThreadId, AgentStatus>,
         timed_out: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum WaitTimeoutFallback {
+        #[default]
+        ReturnCurrentStatuses,
+        CloseStalledWorkers,
     }
 
     pub async fn handle(
@@ -463,6 +605,7 @@ mod wait {
             .iter()
             .map(|id| agent_id(id))
             .collect::<Result<Vec<_>, _>>()?;
+        let timeout_fallback = args.timeout_fallback;
 
         // Validate timeout.
         // Very short timeouts encourage busy-polling loops in the orchestrator prompt and can
@@ -522,7 +665,7 @@ mod wait {
             }
         }
 
-        let statuses = if !initial_final_statuses.is_empty() {
+        let mut statuses = if !initial_final_statuses.is_empty() {
             initial_final_statuses
         } else {
             // Wait for the first agent to reach a final status.
@@ -556,11 +699,35 @@ mod wait {
             results
         };
 
+        let timed_out = statuses.is_empty();
+        let mut effective_timeout_fallback = timeout_fallback.unwrap_or_default();
+        if timed_out {
+            let timeout_round = record_wait_timeout_round(&session, &turn).await;
+            if timeout_fallback.is_none()
+                && timeout_round >= WAIT_TIMEOUT_ROUNDS_BEFORE_CLOSE_STALLED_WORKERS
+            {
+                effective_timeout_fallback = WaitTimeoutFallback::CloseStalledWorkers;
+            }
+            let mut current_statuses =
+                collect_current_statuses(&session, &receiver_thread_ids).await;
+            if matches!(
+                effective_timeout_fallback,
+                WaitTimeoutFallback::CloseStalledWorkers
+            ) {
+                close_stalled_workers(&session, &receiver_thread_ids, &mut current_statuses).await;
+                mark_closed_workers_from_statuses(&session, &turn, &current_statuses).await;
+                reset_wait_timeout_rounds(&session, &turn).await;
+            }
+            statuses = current_statuses.into_iter().collect();
+        } else {
+            reset_wait_timeout_rounds(&session, &turn).await;
+        }
+
         // Convert payload.
         let statuses_map = statuses.clone().into_iter().collect::<HashMap<_, _>>();
         let result = WaitResult {
             status: statuses_map.clone(),
-            timed_out: statuses.is_empty(),
+            timed_out,
         };
 
         // Final event emission.
@@ -605,6 +772,107 @@ mod wait {
             if is_final(&status) {
                 return Some((thread_id, status));
             }
+        }
+    }
+
+    async fn collect_current_statuses(
+        session: &Arc<Session>,
+        receiver_thread_ids: &[ThreadId],
+    ) -> HashMap<ThreadId, AgentStatus> {
+        let mut statuses = HashMap::with_capacity(receiver_thread_ids.len());
+        for receiver_thread_id in receiver_thread_ids {
+            let status = session
+                .services
+                .agent_control
+                .get_status(*receiver_thread_id)
+                .await;
+            statuses.insert(*receiver_thread_id, status);
+        }
+        statuses
+    }
+
+    async fn close_stalled_workers(
+        session: &Arc<Session>,
+        receiver_thread_ids: &[ThreadId],
+        statuses: &mut HashMap<ThreadId, AgentStatus>,
+    ) {
+        for receiver_thread_id in receiver_thread_ids {
+            let Some(status) = statuses.get(receiver_thread_id) else {
+                continue;
+            };
+            if is_final(status) {
+                continue;
+            }
+            if let Err(err) = session
+                .services
+                .agent_control
+                .shutdown_agent(*receiver_thread_id)
+                .await
+            {
+                tracing::debug!(
+                    agent_id = %receiver_thread_id,
+                    error = %err,
+                    "wait timeout fallback failed to close stalled worker"
+                );
+            }
+            let refreshed = session
+                .services
+                .agent_control
+                .get_status(*receiver_thread_id)
+                .await;
+            statuses.insert(*receiver_thread_id, refreshed);
+        }
+    }
+
+    async fn record_wait_timeout_round(session: &Arc<Session>, turn: &Arc<TurnContext>) -> usize {
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return 1;
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return 1;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.record_collab_wait_timeout()
+    }
+
+    async fn reset_wait_timeout_rounds(session: &Arc<Session>, turn: &Arc<TurnContext>) {
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.reset_collab_wait_timeout_rounds();
+    }
+
+    async fn mark_closed_workers_from_statuses(
+        session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
+        statuses: &HashMap<ThreadId, AgentStatus>,
+    ) {
+        let mut closed_workers = Vec::new();
+        for (thread_id, status) in statuses {
+            if matches!(status, AgentStatus::Shutdown | AgentStatus::NotFound) {
+                closed_workers.push(*thread_id);
+            }
+        }
+        if closed_workers.is_empty() {
+            return;
+        }
+
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        for thread_id in closed_workers {
+            turn_state.mark_collab_worker_closed(thread_id);
         }
     }
 }
@@ -684,6 +952,9 @@ pub mod close_agent {
                 .into(),
             )
             .await;
+        if result.is_ok() {
+            mark_worker_closed(&session, &turn, agent_id).await;
+        }
         result?;
 
         let content = serde_json::to_string(&CloseAgentResult { status }).map_err(|err| {
@@ -694,6 +965,22 @@ pub mod close_agent {
             body: FunctionCallOutputBody::Text(content),
             success: Some(true),
         })
+    }
+
+    async fn mark_worker_closed(
+        session: &Arc<Session>,
+        turn: &Arc<TurnContext>,
+        thread_id: ThreadId,
+    ) {
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.mark_collab_worker_closed(thread_id);
     }
 }
 
@@ -895,7 +1182,7 @@ mod tests {
     }
 
     fn thread_manager() -> ThreadManager {
-        ThreadManager::with_models_provider_for_tests(
+        ThreadManager::with_models_provider(
             CodexAuth::from_api_key("dummy"),
             built_in_model_providers()["openai"].clone(),
         )
@@ -1542,12 +1829,11 @@ mod tests {
         };
         let result: WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
+        let status_after_wait = manager.agent_control().get_status(agent_id).await;
+        assert_eq!(result.timed_out, true);
         assert_eq!(
-            result,
-            WaitResult {
-                status: HashMap::new(),
-                timed_out: true
-            }
+            result.status,
+            HashMap::from([(agent_id, status_after_wait)])
         );
         assert_eq!(success, None);
 
@@ -1587,6 +1873,50 @@ mod tests {
             .submit(Op::Shutdown {})
             .await
             .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_fallback_closes_stalled_workers() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "timeout_ms": MIN_WAIT_TIMEOUT_MS,
+                "timeout_fallback": "close_stalled_workers"
+            })),
+        );
+
+        let output = CollabHandler
+            .handle(invocation)
+            .await
+            .expect("wait should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+
+        assert_eq!(
+            result,
+            WaitResult {
+                status: HashMap::from([(agent_id, AgentStatus::NotFound)]),
+                timed_out: true
+            }
+        );
+        assert_eq!(success, None);
     }
 
     #[tokio::test]

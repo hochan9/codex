@@ -11,6 +11,8 @@ npm i -g @openai/codex
 codex
 ```
 
+Official aliases are available as well: `sub-codex` and `codex-agent`.
+
 You can also install via Homebrew (`brew install --cask codex`) or download a platform-specific release directly from our [GitHub Releases](https://github.com/openai/codex/releases).
 
 ## Documentation quickstart

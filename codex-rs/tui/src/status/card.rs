@@ -36,7 +36,6 @@ use super::rate_limits::StatusRateLimitData;
 use super::rate_limits::StatusRateLimitRow;
 use super::rate_limits::StatusRateLimitValue;
 use super::rate_limits::compose_rate_limit_data;
-use super::rate_limits::compose_rate_limit_data_many;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
 use crate::wrapping::RtOptions;
@@ -76,7 +75,6 @@ struct StatusHistoryCell {
     rate_limits: StatusRateLimitData,
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_status_output(
     config: &Config,
@@ -87,40 +85,6 @@ pub(crate) fn new_status_output(
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
     rate_limits: Option<&RateLimitSnapshotDisplay>,
-    plan_type: Option<PlanType>,
-    now: DateTime<Local>,
-    model_name: &str,
-    collaboration_mode: Option<&str>,
-    reasoning_effort_override: Option<Option<ReasoningEffort>>,
-) -> CompositeHistoryCell {
-    let snapshots = rate_limits.map(std::slice::from_ref).unwrap_or_default();
-    new_status_output_with_rate_limits(
-        config,
-        auth_manager,
-        token_info,
-        total_usage,
-        session_id,
-        thread_name,
-        forked_from,
-        snapshots,
-        plan_type,
-        now,
-        model_name,
-        collaboration_mode,
-        reasoning_effort_override,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn new_status_output_with_rate_limits(
-    config: &Config,
-    auth_manager: &AuthManager,
-    token_info: Option<&TokenUsageInfo>,
-    total_usage: &TokenUsage,
-    session_id: &Option<ThreadId>,
-    thread_name: Option<String>,
-    forked_from: Option<ThreadId>,
-    rate_limits: &[RateLimitSnapshotDisplay],
     plan_type: Option<PlanType>,
     now: DateTime<Local>,
     model_name: &str,
@@ -157,7 +121,7 @@ impl StatusHistoryCell {
         session_id: &Option<ThreadId>,
         thread_name: Option<String>,
         forked_from: Option<ThreadId>,
-        rate_limits: &[RateLimitSnapshotDisplay],
+        rate_limits: Option<&RateLimitSnapshotDisplay>,
         plan_type: Option<PlanType>,
         now: DateTime<Local>,
         model_name: &str,
@@ -225,11 +189,7 @@ impl StatusHistoryCell {
             output: total_usage.output_tokens,
             context_window,
         };
-        let rate_limits = if rate_limits.len() <= 1 {
-            compose_rate_limit_data(rate_limits.first(), now)
-        } else {
-            compose_rate_limit_data_many(rate_limits, now)
-        };
+        let rate_limits = compose_rate_limit_data(rate_limits, now);
 
         Self {
             model_name,

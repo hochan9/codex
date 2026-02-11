@@ -29,6 +29,8 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
+use crate::slash_command::CommandDescriptionLanguage;
+use crate::text_formatting::truncate_text;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -37,6 +39,9 @@ use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ThreadManager;
+use codex_core::agents_store::AgentsStore;
+use codex_core::agents_store::load_agents_store;
+use codex_core::agents_store::save_agents_store;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -517,6 +522,8 @@ pub(crate) struct App {
     pub(crate) auth_manager: Arc<AuthManager>,
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
+    agents_store: AgentsStore,
+    command_description_language: CommandDescriptionLanguage,
     pub(crate) active_profile: Option<String>,
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
@@ -782,6 +789,183 @@ impl App {
         Ok(())
     }
 
+    async fn persist_agents_store(&mut self) {
+        if let Err(err) = save_agents_store(&self.config.codex_home, &self.agents_store).await {
+            tracing::error!(error = %err, "failed to persist agents store");
+            self.chat_widget
+                .add_error_message(format!("Failed to save named agents: {err}"));
+        }
+    }
+
+    fn sync_active_named_agent_ui(&mut self) {
+        self.chat_widget
+            .set_named_agents_registry(self.agents_store.agents.clone());
+        let active_agent = self.agents_store.active_agent().cloned();
+        self.chat_widget.set_active_named_agent(active_agent);
+        self.refresh_status_line();
+    }
+
+    fn normalized_agent_name(input: &str) -> Option<String> {
+        let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!normalized.is_empty()).then_some(normalized)
+    }
+
+    fn slugify_agent_name(name: &str) -> String {
+        let mut output = String::new();
+        let mut previous_was_dash = false;
+        for ch in name.chars() {
+            let normalized = ch.to_ascii_lowercase();
+            if normalized.is_ascii_alphanumeric() {
+                output.push(normalized);
+                previous_was_dash = false;
+            } else if !previous_was_dash {
+                output.push('-');
+                previous_was_dash = true;
+            }
+        }
+        let trimmed = output.trim_matches('-').to_string();
+        if trimmed.is_empty() {
+            "agent".to_string()
+        } else {
+            trimmed
+        }
+    }
+
+    fn next_agent_id(&self, name: &str) -> String {
+        let base = Self::slugify_agent_name(name);
+        let mut candidate = base.clone();
+        let mut suffix = 2usize;
+        while self.agents_store.get_agent(&candidate).is_some() {
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        candidate
+    }
+
+    fn open_named_agents_popup(&mut self) {
+        let mut items: Vec<SelectionItem> = Vec::new();
+
+        items.push(SelectionItem {
+            name: "Create new agent".to_string(),
+            description: Some("Define a custom specialist prompt.".to_string()),
+            actions: vec![Box::new(|tx| tx.send(AppEvent::BeginCreateNamedAgent))],
+            dismiss_on_select: true,
+            search_value: Some("create new agent".to_string()),
+            ..Default::default()
+        });
+
+        if let Some(active_agent_id) = self.agents_store.active_agent_id.clone() {
+            items.push(SelectionItem {
+                name: "Delete active agent".to_string(),
+                description: Some("Remove the currently active named agent profile.".to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::DeleteNamedAgent(active_agent_id.clone()));
+                })],
+                dismiss_on_select: true,
+                search_value: Some("delete active".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let mut agents = self.agents_store.agents.clone();
+        agents.sort_by(|left, right| left.name.cmp(&right.name));
+        for agent in agents {
+            let agent_id = agent.id.clone();
+            let active = self.agents_store.active_agent_id.as_deref() == Some(agent_id.as_str());
+            let description = agent
+                .description
+                .clone()
+                .or_else(|| Some(truncate_text(agent.prompt.trim(), 72)));
+            items.push(SelectionItem {
+                name: agent.name.clone(),
+                description,
+                is_current: active,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::ActivateNamedAgent(agent_id.clone()));
+                })],
+                dismiss_on_select: true,
+                search_value: Some(format!("{} {}", agent.name, agent.id)),
+                ..Default::default()
+            });
+        }
+
+        let footer_note = self
+            .agents_store
+            .active_agent()
+            .map(|agent| Line::from(vec!["Active: ".dim(), agent.name.clone().cyan()]));
+        self.chat_widget.show_selection_view(SelectionViewParams {
+            title: Some("Named Agents".to_string()),
+            subtitle: Some("Switch specialists or manage profiles.".to_string()),
+            footer_note,
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Filter named agents".to_string()),
+            ..Default::default()
+        });
+    }
+
+    async fn activate_named_agent(&mut self, tui: &mut tui::Tui, agent_id: String) -> Result<()> {
+        let Some(agent) = self.agents_store.get_agent(&agent_id).cloned() else {
+            self.chat_widget
+                .add_error_message(format!("Unknown named agent: {agent_id}"));
+            return Ok(());
+        };
+
+        let mut should_persist = false;
+        if self.agents_store.active_agent_id.as_deref() != Some(agent_id.as_str()) {
+            self.agents_store
+                .set_active_agent_id(Some(agent_id.clone()));
+            should_persist = true;
+        }
+
+        let thread_id = match self
+            .agents_store
+            .thread_binding(&agent_id)
+            .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
+        {
+            Some(thread_id) if self.server.get_thread(thread_id).await.is_ok() => {
+                self.handle_thread_created(thread_id).await?;
+                thread_id
+            }
+            _ => {
+                let mut config = self.config.clone();
+                self.apply_runtime_policy_overrides(&mut config);
+                let started = self.server.start_thread(config).await?;
+                let new_thread_id = started.thread_id;
+                self.agents_store
+                    .set_thread_binding(&agent_id, new_thread_id.to_string());
+                should_persist = true;
+                self.handle_thread_created(new_thread_id).await?;
+                new_thread_id
+            }
+        };
+
+        if should_persist {
+            self.persist_agents_store().await;
+        }
+        self.select_agent_thread(tui, thread_id).await?;
+        self.agents_store.set_active_agent_id(Some(agent_id));
+        self.sync_active_named_agent_ui();
+        self.chat_widget
+            .add_info_message(format!("Activated named agent: {}", agent.name), None);
+        Ok(())
+    }
+
+    async fn sync_named_agent_for_thread(&mut self, thread_id: ThreadId) {
+        let thread_id_text = thread_id.to_string();
+        let mapped_agent_id = self
+            .agents_store
+            .find_agent_id_for_thread(&thread_id_text)
+            .map(ToString::to_string);
+        let changed = self.agents_store.active_agent_id != mapped_agent_id;
+        self.agents_store.set_active_agent_id(mapped_agent_id);
+        if changed {
+            self.persist_agents_store().await;
+        }
+        self.sync_active_named_agent_ui();
+    }
+
     async fn open_agent_picker(&mut self) {
         let thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().cloned().collect();
         for thread_id in thread_ids {
@@ -864,10 +1048,13 @@ impl App {
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         let codex_op_tx = crate::chatwidget::spawn_op_forwarder(thread);
         self.chat_widget = ChatWidget::new_with_op_sender(init, codex_op_tx);
+        self.chat_widget
+            .set_command_description_language(self.command_description_language);
 
         self.reset_for_thread_switch(tui)?;
         self.replay_thread_snapshot(snapshot);
         self.drain_active_thread_events(tui).await?;
+        self.sync_named_agent_for_thread(thread_id).await;
 
         Ok(())
     }
@@ -1017,6 +1204,14 @@ impl App {
             otel_manager.counter("codex.status_line", 1, &[]);
         }
 
+        let agents_store = match load_agents_store(&config.codex_home).await {
+            Ok(store) => store,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load agents store; using defaults");
+                AgentsStore::default()
+            }
+        };
+
         let status_line_invalid_items_warned = Arc::new(AtomicBool::new(false));
 
         let enhanced_keys_supported = tui.enhanced_keys_supported();
@@ -1108,6 +1303,9 @@ impl App {
         };
 
         chat_widget.maybe_prompt_windows_sandbox_enable();
+        chat_widget.set_command_description_language(CommandDescriptionLanguage::English);
+        chat_widget.set_named_agents_registry(agents_store.agents.clone());
+        chat_widget.set_active_named_agent(agents_store.active_agent().cloned());
 
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         #[cfg(not(debug_assertions))]
@@ -1120,6 +1318,8 @@ impl App {
             chat_widget,
             auth_manager: auth_manager.clone(),
             config,
+            agents_store,
+            command_description_language: CommandDescriptionLanguage::English,
             active_profile,
             cli_kv_overrides,
             harness_overrides,
@@ -1345,6 +1545,9 @@ impl App {
                     otel_manager: self.otel_manager.clone(),
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
+                self.chat_widget
+                    .set_command_description_language(self.command_description_language);
+                self.sync_active_named_agent_ui();
                 self.reset_thread_event_state();
                 if let Some(summary) = summary {
                     let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
@@ -1415,6 +1618,10 @@ impl App {
                                     resumed.thread,
                                     resumed.session_configured,
                                 );
+                                self.chat_widget.set_command_description_language(
+                                    self.command_description_language,
+                                );
+                                self.sync_active_named_agent_ui();
                                 self.reset_thread_event_state();
                                 if let Some(summary) = summary {
                                     let mut lines: Vec<Line<'static>> =
@@ -1475,6 +1682,10 @@ impl App {
                                     forked.thread,
                                     forked.session_configured,
                                 );
+                                self.chat_widget.set_command_description_language(
+                                    self.command_description_language,
+                                );
+                                self.sync_active_named_agent_ui();
                                 self.reset_thread_event_state();
                                 if let Some(summary) = summary {
                                     let mut lines: Vec<Line<'static>> =
@@ -1535,11 +1746,6 @@ impl App {
                     } else {
                         tui.insert_history_lines(display);
                     }
-                }
-            }
-            AppEvent::ApplyThreadRollback { num_turns } => {
-                if self.apply_non_pending_thread_rollback(num_turns) {
-                    tui.frame_requester().schedule_frame();
                 }
             }
             AppEvent::StartCommitAnimation => {
@@ -2187,6 +2393,68 @@ impl App {
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread(tui, thread_id).await?;
             }
+            AppEvent::OpenAgentsPopup => {
+                self.open_named_agents_popup();
+            }
+            AppEvent::ActivateNamedAgent(agent_id) => {
+                self.activate_named_agent(tui, agent_id).await?;
+            }
+            AppEvent::BeginCreateNamedAgent => {
+                self.chat_widget.open_named_agent_name_prompt();
+            }
+            AppEvent::NamedAgentNameSubmitted(name) => {
+                let Some(normalized_name) = Self::normalized_agent_name(&name) else {
+                    self.chat_widget
+                        .add_error_message("Agent name cannot be empty.".to_string());
+                    return Ok(AppRunControl::Continue);
+                };
+                self.chat_widget
+                    .open_named_agent_prompt_prompt(normalized_name);
+            }
+            AppEvent::NamedAgentPromptSubmitted { name, prompt } => {
+                let trimmed_prompt = prompt.trim().to_string();
+                if trimmed_prompt.is_empty() {
+                    self.chat_widget
+                        .add_error_message("Agent prompt cannot be empty.".to_string());
+                    return Ok(AppRunControl::Continue);
+                }
+                let agent_id = self.next_agent_id(&name);
+                self.agents_store
+                    .upsert_agent(codex_core::agents_store::AgentDefinition {
+                        id: agent_id.clone(),
+                        name,
+                        description: None,
+                        prompt: trimmed_prompt,
+                        model: None,
+                        reasoning_effort: None,
+                    });
+                self.agents_store
+                    .set_active_agent_id(Some(agent_id.clone()));
+                self.persist_agents_store().await;
+                self.activate_named_agent(tui, agent_id).await?;
+            }
+            AppEvent::DeleteNamedAgent(agent_id) => {
+                let Some(removed) = self.agents_store.remove_agent(&agent_id) else {
+                    self.chat_widget
+                        .add_error_message(format!("Named agent not found: {agent_id}"));
+                    return Ok(AppRunControl::Continue);
+                };
+                self.persist_agents_store().await;
+                self.sync_active_named_agent_ui();
+                self.chat_widget
+                    .add_info_message(format!("Deleted named agent: {}", removed.name), None);
+            }
+            AppEvent::SetCommandDescriptionLanguage(language) => {
+                self.command_description_language = language;
+                self.chat_widget.set_command_description_language(language);
+                self.chat_widget.add_info_message(
+                    format!(
+                        "Slash-command descriptions are now shown in {}.",
+                        language.display_name()
+                    ),
+                    None,
+                );
+            }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
             }
@@ -2329,6 +2597,7 @@ impl App {
     }
 
     fn handle_codex_event_replay(&mut self, event: Event) {
+        self.handle_backtrack_event(&event.msg);
         self.chat_widget.handle_codex_event_replay(event);
     }
 
@@ -2624,17 +2893,18 @@ mod tests {
     use crate::history_cell::HistoryCell;
     use crate::history_cell::UserHistoryCell;
     use crate::history_cell::new_session_info;
+    use codex_core::AuthManager;
     use codex_core::CodexAuth;
+    use codex_core::ThreadManager;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
+    use codex_core::models_manager::manager::ModelsManager;
     use codex_core::protocol::AskForApproval;
     use codex_core::protocol::Event;
     use codex_core::protocol::EventMsg;
     use codex_core::protocol::SandboxPolicy;
     use codex_core::protocol::SessionConfiguredEvent;
     use codex_core::protocol::SessionSource;
-    use codex_core::protocol::ThreadRolledBackEvent;
-    use codex_core::protocol::UserMessageEvent;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
     use codex_protocol::user_input::TextElement;
@@ -2723,17 +2993,14 @@ mod tests {
     async fn make_test_app() -> App {
         let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
-        let server = Arc::new(
-            codex_core::test_support::thread_manager_with_models_provider(
-                CodexAuth::from_api_key("Test API Key"),
-                config.model_provider.clone(),
-            ),
-        );
-        let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        let server = Arc::new(ThreadManager::with_models_provider(
             CodexAuth::from_api_key("Test API Key"),
-        );
+            config.model_provider.clone(),
+        ));
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
-        let model = codex_core::test_support::get_model_offline(config.model.as_deref());
+        let model = ModelsManager::get_model_offline(config.model.as_deref());
         let otel_manager = test_otel_manager(&config, model.as_str());
 
         App {
@@ -2743,6 +3010,8 @@ mod tests {
             chat_widget,
             auth_manager,
             config,
+            agents_store: AgentsStore::default(),
+            command_description_language: CommandDescriptionLanguage::English,
             active_profile: None,
             cli_kv_overrides: Vec::new(),
             harness_overrides: ConfigOverrides::default(),
@@ -2779,17 +3048,14 @@ mod tests {
     ) {
         let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
-        let server = Arc::new(
-            codex_core::test_support::thread_manager_with_models_provider(
-                CodexAuth::from_api_key("Test API Key"),
-                config.model_provider.clone(),
-            ),
-        );
-        let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        let server = Arc::new(ThreadManager::with_models_provider(
             CodexAuth::from_api_key("Test API Key"),
-        );
+            config.model_provider.clone(),
+        ));
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
-        let model = codex_core::test_support::get_model_offline(config.model.as_deref());
+        let model = ModelsManager::get_model_offline(config.model.as_deref());
         let otel_manager = test_otel_manager(&config, model.as_str());
 
         (
@@ -2800,6 +3066,8 @@ mod tests {
                 chat_widget,
                 auth_manager,
                 config,
+                agents_store: AgentsStore::default(),
+                command_description_language: CommandDescriptionLanguage::English,
                 active_profile: None,
                 cli_kv_overrides: Vec::new(),
                 harness_overrides: ConfigOverrides::default(),
@@ -2833,7 +3101,7 @@ mod tests {
     }
 
     fn test_otel_manager(config: &Config, model: &str) -> OtelManager {
-        let model_info = codex_core::test_support::construct_model_info_offline(model, config);
+        let model_info = ModelsManager::construct_model_info_offline(model, config);
         OtelManager::new(
             ThreadId::new(),
             model,
@@ -2849,7 +3117,7 @@ mod tests {
     }
 
     fn all_model_presets() -> Vec<ModelPreset> {
-        codex_core::test_support::all_model_presets().clone()
+        codex_core::models_manager::model_presets::all_model_presets().clone()
     }
 
     fn model_migration_copy_to_plain_text(
@@ -3144,211 +3412,6 @@ mod tests {
         }
 
         assert_eq!(rollback_turns, Some(1));
-    }
-
-    #[tokio::test]
-    async fn replayed_initial_messages_apply_rollback_in_queue_order() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-
-        let session_id = ThreadId::new();
-        app.handle_codex_event_replay(Event {
-            id: String::new(),
-            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
-                session_id,
-                forked_from_id: None,
-                thread_name: None,
-                model: "gpt-test".to_string(),
-                model_provider_id: "test-provider".to_string(),
-                approval_policy: AskForApproval::Never,
-                sandbox_policy: SandboxPolicy::ReadOnly,
-                cwd: PathBuf::from("/home/user/project"),
-                reasoning_effort: None,
-                history_log_id: 0,
-                history_entry_count: 0,
-                initial_messages: Some(vec![
-                    EventMsg::UserMessage(UserMessageEvent {
-                        message: "first prompt".to_string(),
-                        images: None,
-                        local_images: Vec::new(),
-                        text_elements: Vec::new(),
-                    }),
-                    EventMsg::UserMessage(UserMessageEvent {
-                        message: "second prompt".to_string(),
-                        images: None,
-                        local_images: Vec::new(),
-                        text_elements: Vec::new(),
-                    }),
-                    EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
-                    EventMsg::UserMessage(UserMessageEvent {
-                        message: "third prompt".to_string(),
-                        images: None,
-                        local_images: Vec::new(),
-                        text_elements: Vec::new(),
-                    }),
-                ]),
-                network_proxy: None,
-                rollout_path: Some(PathBuf::new()),
-            }),
-        });
-
-        let mut saw_rollback = false;
-        while let Ok(event) = app_event_rx.try_recv() {
-            match event {
-                AppEvent::InsertHistoryCell(cell) => {
-                    let cell: Arc<dyn HistoryCell> = cell.into();
-                    app.transcript_cells.push(cell);
-                }
-                AppEvent::ApplyThreadRollback { num_turns } => {
-                    saw_rollback = true;
-                    crate::app_backtrack::trim_transcript_cells_drop_last_n_user_turns(
-                        &mut app.transcript_cells,
-                        num_turns,
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        assert!(saw_rollback);
-        let user_messages: Vec<String> = app
-            .transcript_cells
-            .iter()
-            .filter_map(|cell| {
-                cell.as_any()
-                    .downcast_ref::<UserHistoryCell>()
-                    .map(|cell| cell.message.clone())
-            })
-            .collect();
-        assert_eq!(
-            user_messages,
-            vec!["first prompt".to_string(), "third prompt".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn live_rollback_during_replay_is_applied_in_app_event_order() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-
-        let session_id = ThreadId::new();
-        app.handle_codex_event_replay(Event {
-            id: String::new(),
-            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
-                session_id,
-                forked_from_id: None,
-                thread_name: None,
-                model: "gpt-test".to_string(),
-                model_provider_id: "test-provider".to_string(),
-                approval_policy: AskForApproval::Never,
-                sandbox_policy: SandboxPolicy::ReadOnly,
-                cwd: PathBuf::from("/home/user/project"),
-                reasoning_effort: None,
-                history_log_id: 0,
-                history_entry_count: 0,
-                initial_messages: Some(vec![
-                    EventMsg::UserMessage(UserMessageEvent {
-                        message: "first prompt".to_string(),
-                        images: None,
-                        local_images: Vec::new(),
-                        text_elements: Vec::new(),
-                    }),
-                    EventMsg::UserMessage(UserMessageEvent {
-                        message: "second prompt".to_string(),
-                        images: None,
-                        local_images: Vec::new(),
-                        text_elements: Vec::new(),
-                    }),
-                ]),
-                network_proxy: None,
-                rollout_path: Some(PathBuf::new()),
-            }),
-        });
-
-        // Simulate a live rollback arriving before queued replay inserts are drained.
-        app.handle_codex_event_now(Event {
-            id: "live-rollback".to_string(),
-            msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
-        });
-
-        let mut saw_rollback = false;
-        while let Ok(event) = app_event_rx.try_recv() {
-            match event {
-                AppEvent::InsertHistoryCell(cell) => {
-                    let cell: Arc<dyn HistoryCell> = cell.into();
-                    app.transcript_cells.push(cell);
-                }
-                AppEvent::ApplyThreadRollback { num_turns } => {
-                    saw_rollback = true;
-                    crate::app_backtrack::trim_transcript_cells_drop_last_n_user_turns(
-                        &mut app.transcript_cells,
-                        num_turns,
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        assert!(saw_rollback);
-        let user_messages: Vec<String> = app
-            .transcript_cells
-            .iter()
-            .filter_map(|cell| {
-                cell.as_any()
-                    .downcast_ref::<UserHistoryCell>()
-                    .map(|cell| cell.message.clone())
-            })
-            .collect();
-        assert_eq!(user_messages, vec!["first prompt".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn queued_rollback_syncs_overlay_and_clears_deferred_history() {
-        let mut app = make_test_app().await;
-        app.transcript_cells = vec![
-            Arc::new(UserHistoryCell {
-                message: "first".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("after first")],
-                false,
-            )) as Arc<dyn HistoryCell>,
-            Arc::new(UserHistoryCell {
-                message: "second".to_string(),
-                text_elements: Vec::new(),
-                local_image_paths: Vec::new(),
-            }) as Arc<dyn HistoryCell>,
-            Arc::new(AgentMessageCell::new(
-                vec![Line::from("after second")],
-                false,
-            )) as Arc<dyn HistoryCell>,
-        ];
-        app.overlay = Some(Overlay::new_transcript(app.transcript_cells.clone()));
-        app.deferred_history_lines = vec![Line::from("stale buffered line")];
-        app.backtrack.overlay_preview_active = true;
-        app.backtrack.nth_user_message = 1;
-
-        let changed = app.apply_non_pending_thread_rollback(1);
-
-        assert!(changed);
-        assert!(app.backtrack_render_pending);
-        assert!(app.deferred_history_lines.is_empty());
-        assert_eq!(app.backtrack.nth_user_message, 0);
-        let user_messages: Vec<String> = app
-            .transcript_cells
-            .iter()
-            .filter_map(|cell| {
-                cell.as_any()
-                    .downcast_ref::<UserHistoryCell>()
-                    .map(|cell| cell.message.clone())
-            })
-            .collect();
-        assert_eq!(user_messages, vec!["first".to_string()]);
-        let overlay_cell_count = match app.overlay.as_ref() {
-            Some(Overlay::Transcript(t)) => t.committed_cell_count(),
-            _ => panic!("expected transcript overlay"),
-        };
-        assert_eq!(overlay_cell_count, app.transcript_cells.len());
     }
 
     #[tokio::test]
