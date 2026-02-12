@@ -1,5 +1,5 @@
 use crate::codex_message_processor::ApiVersion;
-use crate::codex_message_processor::read_rollout_items_from_rollout;
+use crate::codex_message_processor::read_event_msgs_from_rollout;
 use crate::codex_message_processor::read_summary_from_rollout;
 use crate::codex_message_processor::summary_to_thread;
 use crate::error_code::INTERNAL_ERROR_CODE;
@@ -67,7 +67,7 @@ use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStatus;
-use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_app_server_protocol::build_turns_from_event_msgs;
 use codex_core::CodexThread;
 use codex_core::parse_command::shlex_join;
 use codex_core::protocol::ApplyPatchApprovalRequestEvent;
@@ -1089,9 +1089,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                 {
                     Ok(summary) => {
                         let mut thread = summary_to_thread(summary);
-                        match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+                        match read_event_msgs_from_rollout(rollout_path.as_path()).await {
                             Ok(items) => {
-                                thread.turns = build_turns_from_rollout_items(&items);
+                                thread.turns = build_turns_from_event_msgs(&items);
                                 ThreadRollbackResponse { thread }
                             }
                             Err(err) => {

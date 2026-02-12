@@ -1876,8 +1876,7 @@ mod tests {
     #[test]
     fn js_repl_requires_feature_flag() {
         let config = test_config();
-        let model_info =
-            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
         let features = Features::with_defaults();
 
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
@@ -1900,8 +1899,7 @@ mod tests {
     #[test]
     fn js_repl_enabled_adds_tools() {
         let config = test_config();
-        let model_info =
-            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::JsRepl);
 

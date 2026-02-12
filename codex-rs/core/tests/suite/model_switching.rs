@@ -402,7 +402,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         visibility: ModelVisibility::List,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
-        prefer_websockets: false,
         priority: 1,
         upgrade: None,
         base_instructions: "base instructions".to_string(),

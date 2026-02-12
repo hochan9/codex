@@ -2610,6 +2610,7 @@ impl App {
             AppEvent::StatusLineSetupCancelled => {
                 self.chat_widget.cancel_status_line_setup();
             }
+            AppEvent::BeginWindowsSandboxLegacySetup { .. } => {}
         }
         Ok(AppRunControl::Continue)
     }

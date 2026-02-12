@@ -1000,7 +1000,7 @@ async fn websocket_harness_with_options(
     runtime_metrics_enabled: bool,
     websocket_enabled: bool,
     websocket_v2_enabled: bool,
-    prefer_websockets: bool,
+    _prefer_websockets: bool,
 ) -> WebsocketTestHarness {
     let provider = websocket_provider(server);
     let codex_home = TempDir::new().unwrap();
@@ -1018,11 +1018,13 @@ async fn websocket_harness_with_options(
         config.features.enable(Feature::ResponsesWebsocketsV2);
     }
     let config = Arc::new(config);
-    let mut model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
-    model_info.prefer_websockets = prefer_websockets;
+    let model_info =
+        codex_core::models_manager::manager::ModelsManager::construct_model_info_offline(
+            MODEL, &config,
+        );
     let conversation_id = ThreadId::new();
     let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
+        codex_core::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let exporter = InMemoryMetricExporter::default();
     let metrics = MetricsClient::new(
         MetricsConfig::in_memory("test", "codex-core", env!("CARGO_PKG_VERSION"), exporter)

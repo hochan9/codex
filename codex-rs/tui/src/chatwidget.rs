@@ -234,8 +234,6 @@ use crate::streaming::controller::PlanStreamController;
 use crate::streaming::controller::StreamController;
 
 use chrono::Local;
-use codex_common::approval_presets::ApprovalPreset;
-use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ThreadManager;
@@ -246,6 +244,8 @@ use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_utils_approval_presets::ApprovalPreset;
+use codex_utils_approval_presets::builtin_approval_presets;
 use strum::IntoEnumIterator;
 
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
@@ -443,23 +443,14 @@ enum ConnectorsCacheState {
 
 #[derive(Debug)]
 enum RateLimitErrorKind {
-    ModelCap {
-        model: String,
-        reset_after_seconds: Option<u64>,
-    },
+    ServerOverloaded,
     UsageLimit,
     Generic,
 }
 
 fn rate_limit_error_kind(info: &CodexErrorInfo) -> Option<RateLimitErrorKind> {
     match info {
-        CodexErrorInfo::ModelCap {
-            model,
-            reset_after_seconds,
-        } => Some(RateLimitErrorKind::ModelCap {
-            model: model.clone(),
-            reset_after_seconds: *reset_after_seconds,
-        }),
+        CodexErrorInfo::ServerOverloaded => Some(RateLimitErrorKind::ServerOverloaded),
         CodexErrorInfo::UsageLimitExceeded => Some(RateLimitErrorKind::UsageLimit),
         CodexErrorInfo::ResponseTooManyFailedAttempts {
             http_status_code: Some(429),
@@ -4081,13 +4072,9 @@ impl ChatWidget {
                     && let Some(kind) = rate_limit_error_kind(&info)
                 {
                     match kind {
-                        RateLimitErrorKind::ModelCap {
-                            model,
-                            reset_after_seconds,
-                        } => self.on_model_cap_error(model, reset_after_seconds),
-                        RateLimitErrorKind::UsageLimit | RateLimitErrorKind::Generic => {
-                            self.on_error(message)
-                        }
+                        RateLimitErrorKind::ServerOverloaded
+                        | RateLimitErrorKind::UsageLimit
+                        | RateLimitErrorKind::Generic => self.on_error(message),
                     }
                 } else {
                     self.on_error(message);
@@ -5571,21 +5558,7 @@ impl ChatWidget {
         current_sandbox: &SandboxPolicy,
         preset: &ApprovalPreset,
     ) -> bool {
-        if current_approval != preset.approval {
-            return false;
-        }
-        matches!(
-            (&preset.sandbox, current_sandbox),
-            (SandboxPolicy::ReadOnly, SandboxPolicy::ReadOnly)
-                | (
-                    SandboxPolicy::DangerFullAccess,
-                    SandboxPolicy::DangerFullAccess
-                )
-                | (
-                    SandboxPolicy::WorkspaceWrite { .. },
-                    SandboxPolicy::WorkspaceWrite { .. }
-                )
-        )
+        current_approval == preset.approval && *current_sandbox == preset.sandbox
     }
 
     #[cfg(target_os = "windows")]

@@ -98,3 +98,55 @@
 2. Add end-to-end tests for automatic split/retry/timeout paths at collab workflow level.
 3. Add explicit user controls for orchestration strategy (`aggressive`, `balanced`, `conservative`) with predictable budget profiles.
 4. Finalize packaging/docs so `sub-codex` is documented as first-class entrypoint in install/release notes.
+
+## Update (2026-02-12)
+
+### Merge and Recovery Work
+- Branch operation:
+  - merged `main` into `feat/release`
+  - merge commit: `5c8d3ac5`
+- During merge resolution, multiple API/signature drifts were fixed so the workspace is buildable again.
+
+### What Was Fixed in This Update
+- Core compile breakages from merge drift:
+  - `codex-rs/core/src/api_bridge.rs`
+  - `codex-rs/core/src/client.rs`
+  - `codex-rs/core/src/codex.rs`
+  - `codex-rs/core/src/tasks/regular.rs`
+- App-server protocol symbol mismatch:
+  - `codex-rs/app-server/src/bespoke_event_handling.rs`
+- Core test compatibility updates caused by upstream API changes:
+  - `codex-rs/core/src/project_doc.rs`
+  - `codex-rs/core/src/tools/spec.rs`
+  - `codex-rs/core/tests/suite/client_websockets.rs`
+  - `codex-rs/core/tests/suite/model_switching.rs`
+- Partial TUI merge compatibility fixes (compile-level paths/import/signature alignment):
+  - `codex-rs/tui/src/chatwidget.rs`
+  - `codex-rs/tui/src/lib.rs`
+  - `codex-rs/tui/src/app.rs`
+
+### Verification (2026-02-12)
+- `just fmt`
+  - passed
+- `cargo build -p codex-cli --bin codex`
+  - passed
+- `cargo test -p codex-core`
+  - compile and test execution recovered
+  - remaining failures are environment-related wiremock port bind restrictions in sandbox (`Operation not permitted`)
+  - latest observed: 961 passed / 6 failed / 4 ignored
+- `cargo test -p codex-tui`
+  - still failing due unresolved merged test/API drift in TUI test code (not production binary build blocker)
+
+### Current Practical State
+- You can build and run CLI binaries again (`codex`, `sub-codex`, `codex-agent` target build path).
+- Full green test matrix is not yet restored because:
+  1. sandbox-limited network/port tests in `codex-core`
+  2. remaining TUI test-suite drift after large merge
+
+### Next Session Priority
+1. Finish TUI test-suite merge reconciliation (`chatwidget/tests.rs`, `status/tests.rs`, related snapshots/import paths).
+2. Re-run:
+   - `cargo test -p codex-tui`
+   - `cargo test -p codex-core` (with elevated permissions for wiremock binding if needed)
+3. After owner approval, run workspace regression:
+   - `cargo test --all-features`
