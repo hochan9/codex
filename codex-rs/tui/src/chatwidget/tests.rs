@@ -1693,6 +1693,52 @@ async fn collab_progress_board_renders_as_fixed_panel() {
 }
 
 #[tokio::test]
+async fn collab_progress_board_respects_korean_language() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_command_description_language(crate::slash_command::CommandDescriptionLanguage::Korean);
+    let sender_thread_id = ThreadId::new();
+    let worker_id = ThreadId::new();
+    chat.handle_codex_event(Event {
+        id: "collab-spawn-begin-ko".into(),
+        msg: EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+            call_id: "spawn-ko".to_string(),
+            sender_thread_id,
+            prompt: "parallelize".to_string(),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "collab-spawn-end-ko".into(),
+        msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+            call_id: "spawn-ko".to_string(),
+            sender_thread_id,
+            new_thread_id: Some(worker_id),
+            prompt: "parallelize".to_string(),
+            status: AgentStatus::PendingInit,
+        }),
+    });
+
+    let width = 100;
+    let height = chat.desired_height(width);
+    let mut terminal =
+        ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
+    terminal.set_viewport_area(Rect::new(0, 0, width, height));
+    terminal
+        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+        .expect("draw chat widget");
+
+    let screen = terminal.backend().vt100().screen().contents();
+    let collapsed = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        collapsed.contains("서브 에이전트 보드"),
+        "expected korean board title in render: {screen}"
+    );
+    assert!(
+        collapsed.contains("대기: 1 작업자"),
+        "expected korean queue counters in board panel: {screen}"
+    );
+}
+
+#[tokio::test]
 async fn submit_user_message_with_mode_errors_when_mode_changes_during_running_turn() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.thread_id = Some(ThreadId::new());

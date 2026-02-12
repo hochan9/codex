@@ -42,6 +42,7 @@ use codex_core::ThreadManager;
 use codex_core::agents_store::AgentsStore;
 use codex_core::agents_store::load_agents_store;
 use codex_core::agents_store::save_agents_store;
+use codex_core::config::CONFIG_TOML_FILE;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -113,6 +114,25 @@ const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+
+fn command_description_language_from_config(codex_home: &Path) -> CommandDescriptionLanguage {
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let raw = match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        Err(_) => return CommandDescriptionLanguage::English,
+    };
+    let parsed = match toml::from_str::<TomlValue>(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => return CommandDescriptionLanguage::English,
+    };
+    parsed
+        .get("tui")
+        .and_then(TomlValue::as_table)
+        .and_then(|table| table.get("command_description_language"))
+        .and_then(TomlValue::as_str)
+        .and_then(CommandDescriptionLanguage::from_config_value)
+        .unwrap_or(CommandDescriptionLanguage::English)
+}
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -1302,8 +1322,10 @@ impl App {
             }
         };
 
+        let command_description_language =
+            command_description_language_from_config(&config.codex_home);
         chat_widget.maybe_prompt_windows_sandbox_enable();
-        chat_widget.set_command_description_language(CommandDescriptionLanguage::English);
+        chat_widget.set_command_description_language(command_description_language);
         chat_widget.set_named_agents_registry(agents_store.agents.clone());
         chat_widget.set_active_named_agent(agents_store.active_agent().cloned());
 
@@ -1319,7 +1341,7 @@ impl App {
             auth_manager: auth_manager.clone(),
             config,
             agents_store,
-            command_description_language: CommandDescriptionLanguage::English,
+            command_description_language,
             active_profile,
             cli_kv_overrides,
             harness_overrides,
@@ -2447,13 +2469,31 @@ impl App {
             AppEvent::SetCommandDescriptionLanguage(language) => {
                 self.command_description_language = language;
                 self.chat_widget.set_command_description_language(language);
-                self.chat_widget.add_info_message(
-                    format!(
+                let message = match language {
+                    CommandDescriptionLanguage::English => format!(
                         "Slash-command descriptions are now shown in {}.",
                         language.display_name()
                     ),
-                    None,
-                );
+                    CommandDescriptionLanguage::Korean => format!(
+                        "슬래시 명령 설명을 {}로 표시합니다.",
+                        language.display_name()
+                    ),
+                };
+                self.chat_widget.add_info_message(message, None);
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_edits(vec![
+                        codex_core::config::edit::command_description_language_edit(
+                            language.config_value(),
+                        ),
+                    ])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist command description language");
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save command description language: {err}"
+                    ));
+                }
             }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
@@ -2916,6 +2956,34 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
     use tokio::time;
+
+    #[test]
+    fn command_description_language_defaults_to_english_without_config() {
+        let codex_home = tempdir().expect("create temp codex home");
+        assert_eq!(
+            command_description_language_from_config(codex_home.path()),
+            CommandDescriptionLanguage::English
+        );
+    }
+
+    #[test]
+    fn command_description_language_reads_korean_from_tui_config() {
+        let codex_home = tempdir().expect("create temp codex home");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        std::fs::write(
+            &config_path,
+            r#"
+[tui]
+command_description_language = "korean"
+"#,
+        )
+        .expect("write config");
+
+        assert_eq!(
+            command_description_language_from_config(codex_home.path()),
+            CommandDescriptionLanguage::Korean
+        );
+    }
 
     #[test]
     fn normalize_harness_overrides_resolves_relative_add_dirs() -> Result<()> {

@@ -3651,10 +3651,24 @@ impl ChatWidget {
 
     fn open_command_description_language_popup(&mut self) {
         let language = self.command_description_language;
+        let (english_desc, korean_desc, title, subtitle) = match language {
+            CommandDescriptionLanguage::English => (
+                "Show slash-command descriptions in English.",
+                "Show slash-command descriptions in Korean.",
+                "Command Description Language",
+                "Choose language for slash-command help text.",
+            ),
+            CommandDescriptionLanguage::Korean => (
+                "슬래시 명령 설명을 영어로 표시합니다.",
+                "슬래시 명령 설명을 한국어로 표시합니다.",
+                "명령 설명 언어",
+                "슬래시 명령 도움말 텍스트의 언어를 선택하세요.",
+            ),
+        };
         let items = vec![
             SelectionItem {
                 name: "English".to_string(),
-                description: Some("Show slash-command descriptions in English.".to_string()),
+                description: Some(english_desc.to_string()),
                 is_current: language == CommandDescriptionLanguage::English,
                 actions: vec![Box::new(|tx| {
                     tx.send(AppEvent::SetCommandDescriptionLanguage(
@@ -3667,7 +3681,7 @@ impl ChatWidget {
             },
             SelectionItem {
                 name: "Korean".to_string(),
-                description: Some("슬래시 명령 설명을 한국어로 표시합니다.".to_string()),
+                description: Some(korean_desc.to_string()),
                 is_current: language == CommandDescriptionLanguage::Korean,
                 actions: vec![Box::new(|tx| {
                     tx.send(AppEvent::SetCommandDescriptionLanguage(
@@ -3680,8 +3694,8 @@ impl ChatWidget {
             },
         ];
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Command Description Language".to_string()),
-            subtitle: Some("Choose language for slash-command help text.".to_string()),
+            title: Some(title.to_string()),
+            subtitle: Some(subtitle.to_string()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             is_searchable: false,
@@ -4158,38 +4172,41 @@ impl ChatWidget {
             EventMsg::CollabAgentSpawnEnd(ev) => {
                 self.collab_progress_board
                     .on_spawn_end(&ev.call_id, ev.new_thread_id, &ev.status);
-                self.on_collab_event(collab::spawn_end(ev));
+                self.on_collab_event(collab::spawn_end(ev, self.command_description_language));
             }
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
                 self.collab_progress_board
                     .on_interaction_end(ev.receiver_thread_id, &ev.status);
-                self.on_collab_event(collab::interaction_end(ev))
+                self.on_collab_event(collab::interaction_end(
+                    ev,
+                    self.command_description_language,
+                ))
             }
             EventMsg::CollabWaitingBegin(ev) => {
                 self.collab_progress_board
                     .on_wait_begin(&ev.receiver_thread_ids);
-                self.on_collab_event(collab::waiting_begin(ev));
+                self.on_collab_event(collab::waiting_begin(ev, self.command_description_language));
             }
             EventMsg::CollabWaitingEnd(ev) => {
                 self.collab_progress_board.on_wait_end(&ev.statuses);
-                self.on_collab_event(collab::waiting_end(ev));
+                self.on_collab_event(collab::waiting_end(ev, self.command_description_language));
             }
             EventMsg::CollabCloseBegin(_) => {}
             EventMsg::CollabCloseEnd(ev) => {
                 self.collab_progress_board
                     .on_close_end(ev.receiver_thread_id);
-                self.on_collab_event(collab::close_end(ev));
+                self.on_collab_event(collab::close_end(ev, self.command_description_language));
             }
             EventMsg::CollabResumeBegin(ev) => {
                 self.collab_progress_board
                     .on_resume_begin(ev.receiver_thread_id);
-                self.on_collab_event(collab::resume_begin(ev));
+                self.on_collab_event(collab::resume_begin(ev, self.command_description_language));
             }
             EventMsg::CollabResumeEnd(ev) => {
                 self.collab_progress_board
                     .on_resume_end(ev.receiver_thread_id, &ev.status);
-                self.on_collab_event(collab::resume_end(ev));
+                self.on_collab_event(collab::resume_end(ev, self.command_description_language));
             }
             EventMsg::ThreadRolledBack(_) => {}
             EventMsg::RawResponseItem(_)
@@ -7289,7 +7306,10 @@ impl ChatWidget {
         };
         let mut flex = FlexRenderable::new();
         flex.push(1, active_cell_renderable);
-        if let Some(progress_board) = collab::progress_board(self.collab_progress_board.summary()) {
+        if let Some(progress_board) = collab::progress_board(
+            self.collab_progress_board.summary(),
+            self.command_description_language,
+        ) {
             let progress_board: Box<dyn HistoryCell> = Box::new(progress_board);
             flex.push(
                 0,

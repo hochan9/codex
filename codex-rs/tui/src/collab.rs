@@ -1,5 +1,6 @@
 use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
+use crate::slash_command::CommandDescriptionLanguage;
 use crate::text_formatting::truncate_text;
 use codex_core::protocol::AgentStatus;
 use codex_core::protocol::CollabAgentInteractionEndEvent;
@@ -19,6 +20,17 @@ use std::collections::HashSet;
 const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
+
+fn i18n(
+    language: CommandDescriptionLanguage,
+    english: &'static str,
+    korean: &'static str,
+) -> &'static str {
+    match language {
+        CommandDescriptionLanguage::English => english,
+        CommandDescriptionLanguage::Korean => korean,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProgressBoard {
@@ -161,70 +173,87 @@ impl ProgressBoard {
     }
 }
 
-pub(crate) fn progress_board(summary: ProgressSummary) -> Option<PlainHistoryCell> {
+pub(crate) fn progress_board(
+    summary: ProgressSummary,
+    language: CommandDescriptionLanguage,
+) -> Option<PlainHistoryCell> {
     if summary.is_empty() {
         return None;
     }
 
     let active_line = detail_line_spans(
-        "active",
+        i18n(language, "active", "활성"),
         vec![
             Span::from(summary.active_count.to_string()).cyan().bold(),
-            Span::from(" workers").dim(),
+            Span::from(format!(" {}", i18n(language, "workers", "작업자"))).dim(),
         ],
     );
     let mut queued_spans = vec![
         Span::from(summary.queued_count.to_string())
             .magenta()
             .bold(),
-        Span::from(" workers").dim(),
+        Span::from(format!(" {}", i18n(language, "workers", "작업자"))).dim(),
     ];
     if summary.pending_spawn_calls > 0 {
         queued_spans.push(Span::from(" · ").dim());
-        queued_spans
-            .push(Span::from(format!("{} spawn pending", summary.pending_spawn_calls)).dim());
+        queued_spans.push(
+            Span::from(format!(
+                "{} {}",
+                summary.pending_spawn_calls,
+                i18n(language, "spawn pending", "spawn 대기")
+            ))
+            .dim(),
+        );
     }
-    let queued_line = detail_line_spans("queued", queued_spans);
+    let queued_line = detail_line_spans(i18n(language, "queued", "대기"), queued_spans);
 
     let mut done_spans = vec![
         Span::from(summary.done_count.to_string()).green().bold(),
-        Span::from(" workers").dim(),
+        Span::from(format!(" {}", i18n(language, "workers", "작업자"))).dim(),
     ];
     push_status_count(
         &mut done_spans,
         summary.completed_count,
-        "completed",
+        i18n(language, "completed", "완료"),
         ratatui::prelude::Stylize::green,
     );
     push_status_count(
         &mut done_spans,
         summary.errored_count,
-        "errored",
+        i18n(language, "errored", "오류"),
         ratatui::prelude::Stylize::red,
     );
     push_status_count(
         &mut done_spans,
         summary.shutdown_count,
-        "shutdown",
+        i18n(language, "shutdown", "종료"),
         ratatui::prelude::Stylize::dim,
     );
     push_status_count(
         &mut done_spans,
         summary.not_found_count,
-        "not found",
+        i18n(language, "not found", "없음"),
         ratatui::prelude::Stylize::red,
     );
-    let done_line = detail_line_spans("done", done_spans);
+    let done_line = detail_line_spans(i18n(language, "done", "완료"), done_spans);
 
     Some(PlainHistoryCell::new(vec![
-        vec!["Sub-agent board".cyan().bold()].into(),
+        vec![
+            i18n(language, "Sub-agent board", "서브 에이전트 보드")
+                .cyan()
+                .bold(),
+        ]
+        .into(),
         active_line,
         queued_line,
         done_line,
     ]))
 }
 
-pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
+pub(crate) fn spawn_end(
+    ev: CollabAgentSpawnEndEvent,
+    language: CommandDescriptionLanguage,
+) -> PlainHistoryCell {
     let CollabAgentSpawnEndEvent {
         call_id,
         sender_thread_id: _,
@@ -234,19 +263,22 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
     } = ev;
     let new_agent = new_thread_id
         .map(|id| Span::from(id.to_string()))
-        .unwrap_or_else(|| Span::from("not created").dim());
+        .unwrap_or_else(|| Span::from(i18n(language, "not created", "생성되지 않음")).dim());
     let mut details = vec![
-        detail_line("call", call_id),
-        detail_line("agent", new_agent),
-        status_line(&status),
+        detail_line(i18n(language, "call", "호출"), call_id),
+        detail_line(i18n(language, "agent", "에이전트"), new_agent),
+        status_line(&status, language),
     ];
-    if let Some(line) = prompt_line(&prompt) {
+    if let Some(line) = prompt_line(&prompt, language) {
         details.push(line);
     }
-    collab_event("Agent spawned", details)
+    collab_event(i18n(language, "Agent spawned", "에이전트 생성됨"), details)
 }
 
-pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistoryCell {
+pub(crate) fn interaction_end(
+    ev: CollabAgentInteractionEndEvent,
+    language: CommandDescriptionLanguage,
+) -> PlainHistoryCell {
     let CollabAgentInteractionEndEvent {
         call_id,
         sender_thread_id: _,
@@ -255,41 +287,59 @@ pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistor
         status,
     } = ev;
     let mut details = vec![
-        detail_line("call", call_id),
-        detail_line("receiver", receiver_thread_id.to_string()),
-        status_line(&status),
+        detail_line(i18n(language, "call", "호출"), call_id),
+        detail_line(
+            i18n(language, "receiver", "수신"),
+            receiver_thread_id.to_string(),
+        ),
+        status_line(&status, language),
     ];
-    if let Some(line) = prompt_line(&prompt) {
+    if let Some(line) = prompt_line(&prompt, language) {
         details.push(line);
     }
-    collab_event("Input sent", details)
+    collab_event(i18n(language, "Input sent", "입력 전달됨"), details)
 }
 
-pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
+pub(crate) fn waiting_begin(
+    ev: CollabWaitingBeginEvent,
+    language: CommandDescriptionLanguage,
+) -> PlainHistoryCell {
     let CollabWaitingBeginEvent {
         call_id,
         sender_thread_id: _,
         receiver_thread_ids,
     } = ev;
     let details = vec![
-        detail_line("call", call_id),
-        detail_line("receivers", format_thread_ids(&receiver_thread_ids)),
+        detail_line(i18n(language, "call", "호출"), call_id),
+        detail_line(
+            i18n(language, "receivers", "수신 목록"),
+            format_thread_ids(&receiver_thread_ids, language),
+        ),
     ];
-    collab_event("Waiting for agents", details)
+    collab_event(
+        i18n(language, "Waiting for agents", "에이전트 대기 중"),
+        details,
+    )
 }
 
-pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
+pub(crate) fn waiting_end(
+    ev: CollabWaitingEndEvent,
+    language: CommandDescriptionLanguage,
+) -> PlainHistoryCell {
     let CollabWaitingEndEvent {
         call_id,
         sender_thread_id: _,
         statuses,
     } = ev;
-    let mut details = vec![detail_line("call", call_id)];
-    details.extend(wait_complete_lines(&statuses));
-    collab_event("Wait complete", details)
+    let mut details = vec![detail_line(i18n(language, "call", "호출"), call_id)];
+    details.extend(wait_complete_lines(&statuses, language));
+    collab_event(i18n(language, "Wait complete", "대기 완료"), details)
 }
 
-pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
+pub(crate) fn close_end(
+    ev: CollabCloseEndEvent,
+    language: CommandDescriptionLanguage,
+) -> PlainHistoryCell {
     let CollabCloseEndEvent {
         call_id,
         sender_thread_id: _,
@@ -297,27 +347,42 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
         status,
     } = ev;
     let details = vec![
-        detail_line("call", call_id),
-        detail_line("receiver", receiver_thread_id.to_string()),
-        status_line(&status),
+        detail_line(i18n(language, "call", "호출"), call_id),
+        detail_line(
+            i18n(language, "receiver", "수신"),
+            receiver_thread_id.to_string(),
+        ),
+        status_line(&status, language),
     ];
-    collab_event("Agent closed", details)
+    collab_event(i18n(language, "Agent closed", "에이전트 종료됨"), details)
 }
 
-pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
+pub(crate) fn resume_begin(
+    ev: CollabResumeBeginEvent,
+    language: CommandDescriptionLanguage,
+) -> PlainHistoryCell {
     let CollabResumeBeginEvent {
         call_id,
         sender_thread_id: _,
         receiver_thread_id,
     } = ev;
     let details = vec![
-        detail_line("call", call_id),
-        detail_line("receiver", receiver_thread_id.to_string()),
+        detail_line(i18n(language, "call", "호출"), call_id),
+        detail_line(
+            i18n(language, "receiver", "수신"),
+            receiver_thread_id.to_string(),
+        ),
     ];
-    collab_event("Resuming agent", details)
+    collab_event(
+        i18n(language, "Resuming agent", "에이전트 재개 중"),
+        details,
+    )
 }
 
-pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
+pub(crate) fn resume_end(
+    ev: CollabResumeEndEvent,
+    language: CommandDescriptionLanguage,
+) -> PlainHistoryCell {
     let CollabResumeEndEvent {
         call_id,
         sender_thread_id: _,
@@ -325,11 +390,14 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
         status,
     } = ev;
     let details = vec![
-        detail_line("call", call_id),
-        detail_line("receiver", receiver_thread_id.to_string()),
-        status_line(&status),
+        detail_line(i18n(language, "call", "호출"), call_id),
+        detail_line(
+            i18n(language, "receiver", "수신"),
+            receiver_thread_id.to_string(),
+        ),
+        status_line(&status, language),
     ];
-    collab_event("Agent resumed", details)
+    collab_event(i18n(language, "Agent resumed", "에이전트 재개됨"), details)
 }
 
 fn collab_event(title: impl Into<String>, details: Vec<Line<'static>>) -> PlainHistoryCell {
@@ -346,36 +414,41 @@ fn detail_line(label: &str, value: impl Into<Span<'static>>) -> Line<'static> {
     vec![Span::from(format!("{label}: ")).dim(), value.into()].into()
 }
 
-fn status_line(status: &AgentStatus) -> Line<'static> {
-    detail_line("status", status_span(status))
+fn status_line(status: &AgentStatus, language: CommandDescriptionLanguage) -> Line<'static> {
+    detail_line(
+        i18n(language, "status", "상태"),
+        status_span(status, language),
+    )
 }
 
-fn status_span(status: &AgentStatus) -> Span<'static> {
+fn status_span(status: &AgentStatus, language: CommandDescriptionLanguage) -> Span<'static> {
     match status {
-        AgentStatus::PendingInit => Span::from("pending init").dim(),
-        AgentStatus::Running => Span::from("running").cyan().bold(),
-        AgentStatus::Completed(_) => Span::from("completed").green(),
-        AgentStatus::Errored(_) => Span::from("errored").red(),
-        AgentStatus::Shutdown => Span::from("shutdown").dim(),
-        AgentStatus::NotFound => Span::from("not found").red(),
+        AgentStatus::PendingInit => Span::from(i18n(language, "pending init", "초기화 대기")).dim(),
+        AgentStatus::Running => Span::from(i18n(language, "running", "실행 중"))
+            .cyan()
+            .bold(),
+        AgentStatus::Completed(_) => Span::from(i18n(language, "completed", "완료")).green(),
+        AgentStatus::Errored(_) => Span::from(i18n(language, "errored", "오류")).red(),
+        AgentStatus::Shutdown => Span::from(i18n(language, "shutdown", "종료")).dim(),
+        AgentStatus::NotFound => Span::from(i18n(language, "not found", "없음")).red(),
     }
 }
 
-fn prompt_line(prompt: &str) -> Option<Line<'static>> {
+fn prompt_line(prompt: &str, language: CommandDescriptionLanguage) -> Option<Line<'static>> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(detail_line(
-            "prompt",
+            i18n(language, "prompt", "프롬프트"),
             Span::from(truncate_text(trimmed, COLLAB_PROMPT_PREVIEW_GRAPHEMES)).dim(),
         ))
     }
 }
 
-fn format_thread_ids(ids: &[ThreadId]) -> Span<'static> {
+fn format_thread_ids(ids: &[ThreadId], language: CommandDescriptionLanguage) -> Span<'static> {
     if ids.is_empty() {
-        return Span::from("none").dim();
+        return Span::from(i18n(language, "none", "없음")).dim();
     }
     let joined = ids
         .iter()
@@ -385,9 +458,15 @@ fn format_thread_ids(ids: &[ThreadId]) -> Span<'static> {
     Span::from(joined)
 }
 
-fn wait_complete_lines(statuses: &HashMap<ThreadId, AgentStatus>) -> Vec<Line<'static>> {
+fn wait_complete_lines(
+    statuses: &HashMap<ThreadId, AgentStatus>,
+    language: CommandDescriptionLanguage,
+) -> Vec<Line<'static>> {
     if statuses.is_empty() {
-        return vec![detail_line("agents", Span::from("none").dim())];
+        return vec![detail_line(
+            i18n(language, "agents", "에이전트"),
+            Span::from(i18n(language, "none", "없음")).dim(),
+        )];
     }
 
     let mut pending_init = 0usize;
@@ -407,36 +486,48 @@ fn wait_complete_lines(statuses: &HashMap<ThreadId, AgentStatus>) -> Vec<Line<'s
         }
     }
 
-    let mut summary = vec![Span::from(format!("{} total", statuses.len())).dim()];
+    let mut summary = vec![
+        Span::from(format!(
+            "{}{}",
+            statuses.len(),
+            i18n(language, " total", "개 전체")
+        ))
+        .dim(),
+    ];
     push_status_count(
         &mut summary,
         pending_init,
-        "pending init",
+        i18n(language, "pending init", "초기화 대기"),
         ratatui::prelude::Stylize::dim,
     );
-    push_status_count(&mut summary, running, "running", |span| span.cyan().bold());
+    push_status_count(
+        &mut summary,
+        running,
+        i18n(language, "running", "실행 중"),
+        |span| span.cyan().bold(),
+    );
     push_status_count(
         &mut summary,
         completed,
-        "completed",
+        i18n(language, "completed", "완료"),
         ratatui::prelude::Stylize::green,
     );
     push_status_count(
         &mut summary,
         errored,
-        "errored",
+        i18n(language, "errored", "오류"),
         ratatui::prelude::Stylize::red,
     );
     push_status_count(
         &mut summary,
         shutdown,
-        "shutdown",
+        i18n(language, "shutdown", "종료"),
         ratatui::prelude::Stylize::dim,
     );
     push_status_count(
         &mut summary,
         not_found,
-        "not found",
+        i18n(language, "not found", "없음"),
         ratatui::prelude::Stylize::red,
     );
 
@@ -447,12 +538,15 @@ fn wait_complete_lines(statuses: &HashMap<ThreadId, AgentStatus>) -> Vec<Line<'s
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     let mut lines = Vec::with_capacity(entries.len() + 1);
-    lines.push(detail_line_spans("agents", summary));
+    lines.push(detail_line_spans(
+        i18n(language, "agents", "에이전트"),
+        summary,
+    ));
     lines.extend(entries.into_iter().map(|(thread_id, status)| {
         let mut spans = vec![
             Span::from(thread_id).dim(),
             Span::from(" ").dim(),
-            status_span(status),
+            status_span(status, language),
         ];
         match status {
             AgentStatus::Completed(Some(message)) => {
@@ -481,7 +575,7 @@ fn wait_complete_lines(statuses: &HashMap<ThreadId, AgentStatus>) -> Vec<Line<'s
 fn push_status_count(
     spans: &mut Vec<Span<'static>>,
     count: usize,
-    label: &'static str,
+    label: &str,
     style: impl FnOnce(Span<'static>) -> Span<'static>,
 ) {
     if count == 0 {
@@ -512,6 +606,7 @@ fn is_terminal_status(status: &AgentStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history_cell::HistoryCell;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -589,6 +684,34 @@ mod tests {
 
     #[test]
     fn progress_board_render_returns_none_when_empty() {
-        assert!(progress_board(ProgressSummary::default()).is_none());
+        assert!(
+            progress_board(
+                ProgressSummary::default(),
+                CommandDescriptionLanguage::English
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn progress_board_renders_korean_labels() {
+        let summary = ProgressSummary {
+            active_count: 1,
+            queued_count: 2,
+            done_count: 1,
+            ..ProgressSummary::default()
+        };
+        let board = progress_board(summary, CommandDescriptionLanguage::Korean)
+            .expect("expected board for non-empty summary");
+        let rendered = board
+            .display_lines(100)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("서브 에이전트 보드"));
+        assert!(rendered.contains("활성: "));
+        assert!(rendered.contains("대기: "));
+        assert!(rendered.contains("완료: "));
     }
 }

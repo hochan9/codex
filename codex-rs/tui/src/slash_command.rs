@@ -18,6 +18,21 @@ impl CommandDescriptionLanguage {
             CommandDescriptionLanguage::Korean => "Korean",
         }
     }
+
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            CommandDescriptionLanguage::English => "english",
+            CommandDescriptionLanguage::Korean => "korean",
+        }
+    }
+
+    pub(crate) fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "english" | "en" => Some(CommandDescriptionLanguage::English),
+            "korean" | "ko" | "kr" => Some(CommandDescriptionLanguage::Korean),
+            _ => None,
+        }
+    }
 }
 
 /// Commands that can be invoked by starting a message with a leading slash.
@@ -244,5 +259,23 @@ mod tests {
             SlashCommand::Status.description_in(CommandDescriptionLanguage::Korean),
             "현재 세션 설정과 토큰 사용량을 표시합니다"
         );
+    }
+
+    #[test]
+    fn command_description_language_config_round_trip() {
+        assert_eq!(
+            CommandDescriptionLanguage::from_config_value("english"),
+            Some(CommandDescriptionLanguage::English)
+        );
+        assert_eq!(
+            CommandDescriptionLanguage::from_config_value("KO"),
+            Some(CommandDescriptionLanguage::Korean)
+        );
+        assert_eq!(
+            CommandDescriptionLanguage::English.config_value(),
+            "english"
+        );
+        assert_eq!(CommandDescriptionLanguage::Korean.config_value(), "korean");
+        assert_eq!(CommandDescriptionLanguage::from_config_value("jp"), None);
     }
 }

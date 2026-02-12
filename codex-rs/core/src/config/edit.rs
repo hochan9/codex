@@ -73,6 +73,16 @@ pub fn status_line_items_edit(items: &[String]) -> ConfigEdit {
     }
 }
 
+pub fn command_description_language_edit(language: &str) -> ConfigEdit {
+    ConfigEdit::SetPath {
+        segments: vec![
+            "tui".to_string(),
+            "command_description_language".to_string(),
+        ],
+        value: value(language),
+    }
+}
+
 // TODO(jif) move to a dedicated file
 mod document_helpers {
     use crate::config::types::McpServerConfig;
