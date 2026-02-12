@@ -47,7 +47,7 @@ pub enum SlashCommand {
     Language,
     Approvals,
     Permissions,
-    #[strum(serialize = "setup-elevated-sandbox")]
+    #[strum(serialize = "setup-default-sandbox")]
     ElevateSandbox,
     Experimental,
     Skills,
@@ -123,7 +123,7 @@ impl SlashCommand {
             SlashCommand::Agents => "manage and switch named specialist agents",
             SlashCommand::Approvals => "choose what Codex is allowed to do",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
-            SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
+            SlashCommand::ElevateSandbox => "set up default agent sandbox",
             SlashCommand::Experimental => "toggle experimental features",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
