@@ -4,7 +4,7 @@ use codex_api::AuthProvider as ApiAuthProvider;
 use codex_api::TransportError;
 use codex_api::error::ApiError;
 use codex_api::rate_limits::parse_promo_message;
-use codex_api::rate_limits::parse_rate_limit;
+use codex_api::rate_limits::parse_rate_limit_for_limit;
 use http::HeaderMap;
 use serde::Deserialize;
 
@@ -67,7 +67,10 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
                     if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
                         if err.error.error_type.as_deref() == Some("usage_limit_reached") {
-                            let rate_limits = headers.as_ref().and_then(parse_rate_limit);
+                            let limit_id = extract_header(headers.as_ref(), ACTIVE_LIMIT_HEADER);
+                            let rate_limits = headers.as_ref().and_then(|map| {
+                                parse_rate_limit_for_limit(map, limit_id.as_deref())
+                            });
                             let promo_message = headers.as_ref().and_then(parse_promo_message);
                             let resets_at = err
                                 .error
@@ -76,7 +79,7 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
                             return CodexErr::UsageLimitReached(UsageLimitReachedError {
                                 plan_type: err.error.plan_type,
                                 resets_at,
-                                rate_limits,
+                                rate_limits: rate_limits.map(Box::new),
                                 promo_message,
                             });
                         } else if err.error.error_type.as_deref() == Some("usage_not_included") {
@@ -111,6 +114,7 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
     }
 }
 
+const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
@@ -118,6 +122,7 @@ const CF_RAY_HEADER: &str = "cf-ray";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn map_api_error_maps_server_overloaded() {
@@ -144,8 +149,16 @@ mod tests {
     }
 
     #[test]
-    fn map_api_error_maps_usage_limit_error() {
-        let headers = HeaderMap::new();
+    fn map_api_error_maps_usage_limit_limit_name_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACTIVE_LIMIT_HEADER,
+            http::HeaderValue::from_static("codex_other"),
+        );
+        headers.insert(
+            "x-codex-other-limit-name",
+            http::HeaderValue::from_static("codex_other"),
+        );
         let body = serde_json::json!({
             "error": {
                 "type": "usage_limit_reached",
@@ -163,7 +176,46 @@ mod tests {
         let CodexErr::UsageLimitReached(usage_limit) = err else {
             panic!("expected CodexErr::UsageLimitReached, got {err:?}");
         };
-        assert!(usage_limit.rate_limits.is_some());
+        assert_eq!(
+            usage_limit
+                .rate_limits
+                .as_ref()
+                .and_then(|snapshot| snapshot.limit_name.as_deref()),
+            Some("codex_other")
+        );
+    }
+
+    #[test]
+    fn map_api_error_does_not_fallback_limit_name_to_limit_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACTIVE_LIMIT_HEADER,
+            http::HeaderValue::from_static("codex_other"),
+        );
+        let body = serde_json::json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "plan_type": "pro",
+            }
+        })
+        .to_string();
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: Some(headers),
+            body: Some(body),
+        }));
+
+        let CodexErr::UsageLimitReached(usage_limit) = err else {
+            panic!("expected CodexErr::UsageLimitReached, got {err:?}");
+        };
+        assert_eq!(
+            usage_limit
+                .rate_limits
+                .as_ref()
+                .and_then(|snapshot| snapshot.limit_name.as_deref()),
+            None
+        );
     }
 }
 

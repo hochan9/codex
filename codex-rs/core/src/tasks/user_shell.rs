@@ -21,6 +21,7 @@ use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandBeginEvent;
 use crate::protocol::ExecCommandEndEvent;
 use crate::protocol::ExecCommandSource;
+use crate::protocol::ExecCommandStatus;
 use crate::protocol::SandboxPolicy;
 use crate::protocol::TurnStartedEvent;
 use crate::sandboxing::ExecRequest;
@@ -206,6 +207,7 @@ pub(crate) async fn execute_user_shell_command(
                         exit_code: -1,
                         duration: Duration::ZERO,
                         formatted_output: aborted_message,
+                        status: ExecCommandStatus::Failed,
                     }),
                 )
                 .await;
@@ -232,6 +234,11 @@ pub(crate) async fn execute_user_shell_command(
                             &output,
                             turn_context.truncation_policy,
                         ),
+                        status: if output.exit_code == 0 {
+                            ExecCommandStatus::Completed
+                        } else {
+                            ExecCommandStatus::Failed
+                        },
                     }),
                 )
                 .await;
@@ -271,6 +278,7 @@ pub(crate) async fn execute_user_shell_command(
                             &exec_output,
                             turn_context.truncation_policy,
                         ),
+                        status: ExecCommandStatus::Failed,
                     }),
                 )
                 .await;
