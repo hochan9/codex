@@ -346,9 +346,8 @@ impl ModelClient {
     ///
     /// This combines provider capability and feature gating; both must be true for websocket paths
     /// to be eligible.
-    pub fn responses_websocket_enabled(&self, model_info: &ModelInfo) -> bool {
-        self.state.provider.supports_websockets
-            && (self.state.enable_responses_websockets || model_info.prefer_websockets)
+    pub fn responses_websocket_enabled(&self, _model_info: &ModelInfo) -> bool {
+        self.state.provider.supports_websockets && self.state.enable_responses_websockets
     }
 
     fn responses_websockets_v2_enabled(&self) -> bool {
